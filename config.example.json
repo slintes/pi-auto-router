@@ -1,0 +1,33 @@
+{
+  "classifier": {
+    "provider": "openai-codex",
+    "model": "gpt-5.6-luna",
+    "thinkingLevel": "low"
+  },
+  "routes": {
+    "simple": {
+      "provider": "openai-codex",
+      "model": "gpt-5.6-luna",
+      "thinkingLevel": "low"
+    },
+    "medium": {
+      "provider": "openai-codex",
+      "model": "gpt-5.6-terra",
+      "thinkingLevel": "medium"
+    },
+    "complex": {
+      "provider": "openai-codex",
+      "model": "gpt-5.6-sol",
+      "thinkingLevel": "high"
+    },
+    "reasoning": {
+      "provider": "openai-codex",
+      "model": "gpt-5.6-sol",
+      "thinkingLevel": "xhigh"
+    }
+  },
+  "fallbackCategory": "medium",
+  "classifierTimeoutMs": 30000,
+  "maxPromptChars": 24000,
+  "contextChars": 6000
+}

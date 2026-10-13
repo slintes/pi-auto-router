@@ -1,0 +1,12 @@
+{
+  "name": "pi-auto-router",
+  "version": "0.1.0",
+  "description": "Route Pi prompts with a normal chat LLM to configurable task models",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "engines": { "node": ">=22" },
+  "scripts": { "test": "node --test router.test.js" },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
+  "pi": { "extensions": ["./index.js"] },
+  "files": ["index.js", "router.js", "config.example.json", "README.md"]
+}
