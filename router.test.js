@@ -4,9 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import extension from "./index.js";
-import { CATEGORIES, classificationInput, createRouter, loadConfig, parseCategory, validateConfig } from "./router.js";
+import { CATEGORIES, classificationInput, createRouter, loadConfig, parseCategory, validateConfig, validateModelsConfig } from "./router.js";
 
-const example = JSON.parse(readFileSync(new URL("./config.example.json", import.meta.url), "utf8"));
+const modelsExample = JSON.parse(readFileSync(new URL("./config.example.json", import.meta.url), "utf8"));
+const example = modelsExample.models.auto;
 function config() {
   const value = structuredClone(example);
   value.classifier = { provider: "classify", model: "chat", thinkingLevel: "low" };
@@ -281,42 +282,88 @@ test("config files report the path on invalid JSON or missing file", () => {
   }
 });
 
-test("extension reads config after CLI parsing, CLI overrides env, invalid config fails dispatch", async (t) => {
+test("multiple-model config validates every router and supports old single-router files", () => {
+  assert.deepEqual(validateModelsConfig(modelsExample), modelsExample);
+  assert.deepEqual(validateModelsConfig(example), { models: { auto: example } });
+  for (const value of [null, [], { models: {} }, { models: [] }, { models: null },
+    { models: { "bad/id": example } }, { models: { " bad": example } },
+    { models: { "": example } }, { models: { auto: {} } },
+    { models: { auto: example }, classifier: example.classifier }]) {
+    assert.throws(() => validateModelsConfig(value));
+  }
+  assert.throws(() => validateModelsConfig({ models: { fast: {} } }), /models.fast/);
+});
+
+test("extension registers independent routers at startup; CLI overrides env; invalid config fails loading", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "pi-auto-router-"));
   const originalEnv = process.env.PI_AUTO_ROUTER_CONFIG;
+  const originalArgv = process.argv;
   t.after(() => {
+    process.argv = originalArgv;
     if (originalEnv === undefined) delete process.env.PI_AUTO_ROUTER_CONFIG;
     else process.env.PI_AUTO_ROUTER_CONFIG = originalEnv;
     rmSync(dir, { recursive: true });
   });
-  delete process.env.PI_AUTO_ROUTER_CONFIG;
-  let definition;
+  const path = join(dir, "config.json");
+  const auto = config();
+  const fast = config();
+  fast.classifier.model = "fast-classifier";
+  fast.routes.simple.model = "fast-task";
+  fast.routes.simple.thinkingLevel = "off";
+  writeFileSync(path, JSON.stringify({ models: { auto, fast } }));
+  process.env.PI_AUTO_ROUTER_CONFIG = join(dir, "missing-env.json");
+  process.argv = ["node", "pi", "--auto-router-config", path];
+  const definitions = new Map();
   let flag;
   const pi = {
     registerFlag: (name, options) => { flag = { name, ...options }; },
     getFlag: () => undefined,
-    registerVirtualModel: (value) => { definition = value; },
+    registerVirtualModel: (value) => { definitions.set(value.id, value); },
   };
   extension(pi);
   assert.equal(flag.name, "auto-router-config");
-  assert.equal(definition.provider, "auto-router");
-  assert.equal(definition.id, "auto");
-  assert.deepEqual(definition.thinkingLevels, ["off"]);
-  assert.equal(typeof definition.route, "function");
-  const path = join(dir, "config.json");
-  writeFileSync(path, JSON.stringify(config()));
-  const h = harness();
-  process.env.PI_AUTO_ROUTER_CONFIG = join(dir, "missing-env.json");
-  pi.getFlag = () => path;
-  assert.equal((await definition.route(request(), h.ctx)).model.provider, "simple");
-  // Cached config does not change mid-session; a reload creates a fresh factory.
-  pi.getFlag = () => join(dir, "missing-cli.json");
-  assert.equal((await definition.route(request(), h.ctx)).model.provider, "simple");
-  pi.getFlag = () => undefined;
+  assert.deepEqual([...definitions.keys()], ["auto", "fast"]);
+  for (const definition of definitions.values()) {
+    assert.equal(definition.provider, "autorouter");
+    assert.deepEqual(definition.thinkingLevels, ["off"]);
+    assert.equal(typeof definition.route, "function");
+  }
+  const a = harness(auto);
+  const f = harness(fast);
+  const autoRoute = await definitions.get("auto").route(request(), a.ctx);
+  const fastRoute = await definitions.get("fast").route(request(), f.ctx);
+  assert.equal(autoRoute.model.id, auto.routes.simple.model);
+  assert.equal(fastRoute.model.id, "fast-task");
+  assert.equal(fastRoute.thinkingLevel, "off");
+  assert.equal(a.calls[0].model.id, "chat");
+  assert.equal(f.calls[0].model.id, "fast-classifier");
+  assert.notDeepEqual(autoRoute.state.target, fastRoute.state.target);
+  for (const [id, h, state] of [["auto", a, autoRoute.state], ["fast", f, fastRoute.state]]) {
+    const continued = await definitions.get(id).route(request({ reason: "continuation", state }), h.ctx);
+    assert.equal(continued.model.id, state.target.model);
+    assert.equal(h.calls.length, 1);
+  }
+  // No mid-session reconfiguration; a new factory reads the updated file.
+  writeFileSync(path, JSON.stringify({ models: { fast } }));
+  assert.equal((await definitions.get("auto").route(request(), a.ctx)).model.id, auto.routes.simple.model);
+  definitions.clear();
+  process.argv = ["node", "pi", `--auto-router-config=${path}`];
+  extension(pi);
+  assert.deepEqual([...definitions.keys()], ["fast"]);
+  process.argv = ["node", "pi"];
   process.env.PI_AUTO_ROUTER_CONFIG = path;
   extension(pi);
-  assert.equal((await definition.route(request(), h.ctx)).model.provider, "simple");
-  writeFileSync(path, "{}");
+  pi.getFlag = () => join(dir, "missing-cli.json");
+  assert.throws(() => extension(pi), /cannot load .*missing-cli.json/);
+  pi.getFlag = () => undefined;
+  writeFileSync(path, JSON.stringify(auto));
+  definitions.clear();
   extension(pi);
-  assert.throws(() => definition.route(request(), h.ctx), /cannot load/);
+  assert.deepEqual([...definitions.keys()], ["auto"]);
+  writeFileSync(path, JSON.stringify({ models: { auto, broken: {} } }));
+  definitions.clear();
+  assert.throws(() => extension(pi), /cannot load .*models.broken/);
+  assert.equal(definitions.size, 0);
+  writeFileSync(path, "{}");
+  assert.throws(() => extension(pi), /cannot load/);
 });

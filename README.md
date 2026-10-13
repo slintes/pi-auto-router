@@ -1,26 +1,12 @@
 # Pi Auto Router
 
-A Pi virtual-model extension that uses **one normal chat LLM** to classify each
-new user prompt, then dispatches it to a configured model and thinking level.
+A Pi extension that registers multiple virtual models under **`autorouter`**.
+Each uses a normal chat LLM to classify new user prompts, then dispatches them
+to its own configured models and thinking levels.
 No Jev, Decisions API, extra service, build step, or runtime dependencies.
 Built against Pi 1.1.0's `registerVirtualModel` API.
 
 ## Start
-
-The local `config.json` is ready to edit. Its example uses the OpenAI Codex
-Sol/Terra/Luna chat models present in this machine's Pi catalog. Authenticate
-with `/login` as usual; credentials stay in Pi, not this configuration.
-
-```sh
-pi -e ~/dev/work/pi-auto-router/index.js --model auto-router/auto
-```
-
-To load the package permanently (this changes your Pi settings):
-
-```sh
-pi install ~/dev/work/pi-auto-router
-pi --model auto-router/auto
-```
 
 For a fresh checkout, create the local config first:
 
@@ -28,56 +14,83 @@ For a fresh checkout, create the local config first:
 cp config.example.json config.json
 ```
 
-Use exact provider and model IDs from `pi --list-models`. Each category may use
+The example defines `autorouter/auto` (tiered routing) and `autorouter/fast`
+(all categories use Luna with low thinking). Edit the provider/model IDs to
+match your Pi catalog. Authenticate with `/login` as usual; credentials stay
+in Pi, not this configuration.
+
+```sh
+pi -e ~/dev/work/pi-auto-router/index.js --model autorouter/auto
+```
+
+To load the package permanently (this changes your Pi settings):
+
+```sh
+pi install ~/dev/work/pi-auto-router
+pi --model autorouter/auto
+```
+
+Select another configured router with `/model` or `--model autorouter/fast`.
+Use exact physical provider and model IDs from `pi --list-models`. Each category may use
 a different provider, the same model with different thinking levels, or both.
 All targets and the classifier must be physical **chat** models, not other
 virtual routers, classifier-only models, or image-generation models.
 
 ## Configuration
 
+A single config contains a non-empty `models` map. Each key is the selectable
+virtual model ID; each value is a complete, independent router configuration.
+IDs start with a letter or digit and contain letters, digits, dots, underscores,
+or hyphens. Add more entries to register more routers. There are no shared
+settings or inheritance. See `config.example.json` for a two-router example.
+
 ```json
 {
-  "classifier": {
-    "provider": "openai-codex",
-    "model": "gpt-5.6-luna",
-    "thinkingLevel": "low"
-  },
-  "routes": {
-    "simple": {
-      "provider": "openai-codex",
-      "model": "gpt-5.6-luna",
-      "thinkingLevel": "low"
-    },
-    "medium": {
-      "provider": "openai-codex",
-      "model": "gpt-5.6-terra",
-      "thinkingLevel": "medium"
-    },
-    "complex": {
-      "provider": "openai-codex",
-      "model": "gpt-5.6-sol",
-      "thinkingLevel": "high"
-    },
-    "reasoning": {
-      "provider": "openai-codex",
-      "model": "gpt-5.6-sol",
-      "thinkingLevel": "xhigh"
+  "models": {
+    "auto": {
+      "classifier": {
+        "provider": "openai-codex",
+        "model": "gpt-5.6-luna",
+        "thinkingLevel": "low"
+      },
+      "routes": {
+        "simple": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "thinkingLevel": "low"
+        },
+        "medium": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-terra",
+          "thinkingLevel": "medium"
+        },
+        "complex": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-sol",
+          "thinkingLevel": "high"
+        },
+        "reasoning": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-sol",
+          "thinkingLevel": "xhigh"
+        }
+      },
+      "fallbackCategory": "medium",
+      "classifierTimeoutMs": 30000,
+      "maxPromptChars": 24000,
+      "contextChars": 6000
     }
-  },
-  "fallbackCategory": "medium",
-  "classifierTimeoutMs": 30000,
-  "maxPromptChars": 24000,
-  "contextChars": 6000
+  }
 }
 ```
 
-`classifier` and all four `routes` are required. Each requires `provider`,
+Each virtual model requires `classifier` and all four `routes`. Each target requires `provider`,
 `model`, and `thinkingLevel`. Valid levels: `off`, `minimal`, `low`, `medium`,
 `high`, `xhigh`, `max`. Pi clamps levels unsupported by a target model.
 The virtual model offers only `off`: its selection level does not override
 configured physical-model levels. Set them in the JSON, not `--thinking`.
 
-Optional settings:
+Optional settings within each model:
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
@@ -87,9 +100,17 @@ Optional settings:
 | `contextChars` | `6000` | Recent user/assistant text character budget, 0-100000; set 0 to send only the current prompt |
 
 Unknown settings, invalid levels, missing routes, malformed JSON, and out-of-range
-values are rejected rather than silently ignored. Configuration is loaded once
-on first dispatch (Pi parses extension flags after factories run). Restart Pi
-or use `/reload` after editing.
+values are rejected rather than silently ignored. The entire config is validated
+and loaded during extension startup, before model selection; an invalid entry
+prevents all routers from registering. Restart Pi or use `/reload` after editing.
+Each virtual model keeps separate branch-local routing state.
+
+Existing single-router config files (top-level `classifier` and `routes`) still
+register `autorouter/auto`. To add routers, wrap the old configuration in
+`{"models":{"auto": ...}}` and add other entries alongside `auto`.
+The provider ID changed from `auto-router` to `autorouter`: update CLI arguments
+and saved default-model settings. Old sessions must select the new virtual model
+again; their old router state is not migrated.
 
 ### Alternate config files
 
@@ -98,15 +119,18 @@ There is no automatic project-local config discovery.
 
 ```sh
 pi -e ~/dev/work/pi-auto-router/index.js \
-  --auto-router-config ~/my-router.json --model auto-router/auto
+  --auto-router-config ~/my-router.json --model autorouter/auto
 
 PI_AUTO_ROUTER_CONFIG=~/my-router.json \
-  pi -e ~/dev/work/pi-auto-router/index.js --model auto-router/auto
+  pi -e ~/dev/work/pi-auto-router/index.js --model autorouter/auto
 ```
 
 Relative paths resolve against the launch directory; `~/` is supported.
 The default `config.json` is intentionally gitignored. A missing or invalid
-configuration fails the first dispatch before any classifier or task API call.
+configuration fails extension startup before any classifier or task API call.
+The CLI flag supports both `--auto-router-config path` and
+`--auto-router-config=path`. During startup, it is read from process arguments
+because Pi applies extension flag values after factories have run.
 
 ## Routing contract
 
@@ -172,8 +196,9 @@ bash test/pi-smoke.sh
 Tests use Node's built-in runner and fake Pi model registries; no installs,
 credentials, or billed requests are required. They cover validation, parsing,
 context bounds, each route, failures, cancellation, timeout, sticky turns,
-retry/direct behavior, persisted state, and extension config selection.
+retry/direct behavior, persisted state, independent routers, legacy config,
+and startup config selection.
 The smoke script additionally starts real Pi CLI processes against a mock
-in-process chat provider, verifying all four routes, thinking levels, package
-loading, and the custom config flag. It uses isolated temporary Pi settings
+in-process chat provider, verifying both virtual models, all four routes,
+thinking levels, package loading, and CLI config precedence. It uses isolated temporary Pi settings
 and makes no network or paid model requests.

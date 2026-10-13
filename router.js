@@ -69,9 +69,30 @@ export function validateConfig(value) {
   return { classifier, routes, ...options };
 }
 
+export function validateModelsConfig(value) {
+  // Keep existing single-router files working as the "auto" model.
+  if (!Object.hasOwn(value ?? {}, "models")) return { models: { auto: validateConfig(value) } };
+  object(value, "config", ["models"]);
+  object(value.models, "models", Object.keys(value.models ?? {}));
+  const entries = Object.entries(value.models);
+  if (!entries.length) throw new Error("models must contain at least one virtual model");
+  return {
+    models: Object.fromEntries(entries.map(([id, settings]) => {
+      if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(id)) {
+        throw new Error(`Invalid virtual model ID ${JSON.stringify(id)}: use letters, digits, dots, underscores or hyphens, starting with a letter or digit`);
+      }
+      try {
+        return [id, validateConfig(settings)];
+      } catch (error) {
+        throw new Error(`models.${id}: ${error.message}`, { cause: error });
+      }
+    })),
+  };
+}
+
 export function loadConfig(path) {
   try {
-    return validateConfig(JSON.parse(readFileSync(path, "utf8")));
+    return validateModelsConfig(JSON.parse(readFileSync(path, "utf8")));
   } catch (error) {
     throw new Error(`pi-auto-router: cannot load ${path}: ${error.message}`, { cause: error });
   }
