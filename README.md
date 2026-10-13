@@ -8,10 +8,11 @@ Built against Pi 1.1.0's `registerVirtualModel` API.
 
 ## Start
 
-For a fresh checkout, create the local config first:
+For a fresh checkout, copy the example to Pi's user-level config path:
 
 ```sh
-cp config.example.json config.json
+mkdir -p ~/.pi/agent
+cp config.example.json ~/.pi/agent/autorouter.json
 ```
 
 The example defines `autorouter/auto` (tiered routing) and `autorouter/fast`
@@ -114,7 +115,8 @@ again; their old router state is not migrated.
 
 ### Alternate config files
 
-Precedence: CLI flag, environment variable, then `config.json` beside `index.js`.
+Precedence: CLI flag, environment variable, then `autorouter.json` in Pi's agent
+directory (`~/.pi/agent` by default, or `PI_CODING_AGENT_DIR` when set).
 There is no automatic project-local config discovery.
 
 ```sh
@@ -126,8 +128,8 @@ PI_AUTO_ROUTER_CONFIG=~/my-router.json \
 ```
 
 Relative paths resolve against the launch directory; `~/` is supported.
-The default `config.json` is intentionally gitignored. A missing or invalid
-configuration fails extension startup before any classifier or task API call.
+A missing or invalid configuration fails extension startup before any classifier
+or task API call.
 The CLI flag supports both `--auto-router-config path` and
 `--auto-router-config=path`. During startup, it is read from process arguments
 because Pi applies extension flag values after factories have run.

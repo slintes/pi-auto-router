@@ -297,11 +297,14 @@ test("multiple-model config validates every router and supports old single-route
 test("extension registers independent routers at startup; CLI overrides env; invalid config fails loading", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "pi-auto-router-"));
   const originalEnv = process.env.PI_AUTO_ROUTER_CONFIG;
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
   const originalArgv = process.argv;
   t.after(() => {
     process.argv = originalArgv;
     if (originalEnv === undefined) delete process.env.PI_AUTO_ROUTER_CONFIG;
     else process.env.PI_AUTO_ROUTER_CONFIG = originalEnv;
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
     rmSync(dir, { recursive: true });
   });
   const path = join(dir, "config.json");
@@ -311,8 +314,10 @@ test("extension registers independent routers at startup; CLI overrides env; inv
   fast.routes.simple.model = "fast-task";
   fast.routes.simple.thinkingLevel = "off";
   writeFileSync(path, JSON.stringify({ models: { auto, fast } }));
-  process.env.PI_AUTO_ROUTER_CONFIG = join(dir, "missing-env.json");
-  process.argv = ["node", "pi", "--auto-router-config", path];
+  writeFileSync(join(dir, "autorouter.json"), JSON.stringify({ models: { auto } }));
+  process.env.PI_CODING_AGENT_DIR = dir;
+  delete process.env.PI_AUTO_ROUTER_CONFIG;
+  process.argv = ["node", "pi"];
   const definitions = new Map();
   let flag;
   const pi = {
@@ -320,6 +325,12 @@ test("extension registers independent routers at startup; CLI overrides env; inv
     getFlag: () => undefined,
     registerVirtualModel: (value) => { definitions.set(value.id, value); },
   };
+  extension(pi);
+  assert.deepEqual([...definitions.keys()], ["auto"]);
+  definitions.clear();
+
+  process.env.PI_AUTO_ROUTER_CONFIG = join(dir, "missing-env.json");
+  process.argv = ["node", "pi", "--auto-router-config", path];
   extension(pi);
   assert.equal(flag.name, "auto-router-config");
   assert.deepEqual([...definitions.keys()], ["auto", "fast"]);
