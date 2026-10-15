@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import extension from "./index.js";
-import { CATEGORIES, classificationInput, createRouter, loadConfig, parseCategory, validateConfig, validateModelsConfig } from "./router.js";
+import { CATEGORIES, MODE_ENTRY, classificationInput, createRouter, getRoutingMode, loadConfig, parseCategory, parseTierPrefix, setRoutingMode, setRouterStatus, validateConfig, validateModelsConfig } from "./router.js";
 
 const modelsExample = JSON.parse(readFileSync(new URL("./config.example.json", import.meta.url), "utf8"));
 const example = modelsExample.models.auto;
@@ -20,7 +20,7 @@ function user(content = "Build a feature") {
 function response(category = "simple") {
   return { role: "assistant", stopReason: "stop", content: [{ type: "text", text: JSON.stringify({ category }) }] };
 }
-function harness(configuration = config(), result = response()) {
+function harness(configuration = config(), result = response(), id = "auto", branch = []) {
   const models = new Map();
   for (const target of [configuration.classifier, ...Object.values(configuration.routes)]) {
     models.set(`${target.provider}/${target.model}`, { provider: target.provider, id: target.model, api: "chat-api" });
@@ -28,7 +28,11 @@ function harness(configuration = config(), result = response()) {
   const calls = [];
   const warnings = [];
   const statuses = [];
+  const pi = { appendEntry: (customType, data) => branch.push({ type: "custom", customType, data: structuredClone(data) }) };
   const ctx = {
+    mode: "rpc", hasUI: true,
+    model: { provider: "autorouter", id, api: "pi-virtual" },
+    sessionManager: { getBranch: () => branch },
     modelRegistry: {
       find: (provider, id) => models.get(`${provider}/${id}`),
       hasConfiguredAuth: () => true,
@@ -39,7 +43,7 @@ function harness(configuration = config(), result = response()) {
     },
     ui: { notify: (...args) => warnings.push(args), setStatus: (...args) => statuses.push(args) },
   };
-  return { ctx, models, calls, warnings, statuses, route: createRouter(configuration) };
+  return { ctx, pi, branch, models, calls, warnings, statuses, route: createRouter(configuration, pi, id) };
 }
 function request(overrides = {}) {
   return { reason: "user", thinkingLevel: "off", messages: [user()], ...overrides };
@@ -143,9 +147,166 @@ for (const category of CATEGORIES) {
     assert.ok(!("tools" in call.context));
     assert.equal(JSON.parse(call.context.messages[0].content).currentPrompt, "Build a feature");
     assert.equal(h.warnings.length, 0);
-    assert.match(h.statuses[0][1], new RegExp(`^${category} ->`));
+    assert.match(h.statuses.at(-1)[1], new RegExp(`^auto -> ${category} ->`));
   });
 }
+
+test("tier prefixes are exact leading tokens, not prose headings or embedded directives", () => {
+  for (const mode of ["auto", ...CATEGORIES]) {
+    assert.deepEqual(parseTierPrefix(`  :${mode}\nDo the work`), { mode, text: "Do the work" });
+    assert.deepEqual(parseTierPrefix(`:${mode}   `), { mode, text: "" });
+  }
+  for (const text of ["complex: heading", "Explain :complex", "```\n:complex\n```", ":", "hello"]) {
+    assert.equal(parseTierPrefix(text), undefined);
+  }
+  for (const text of [":reasoining task", ":Complex task", ":complex! task", ":autoSECRET task"]) {
+    assert.throws(() => parseTierPrefix(text), /Use :auto, :simple, :medium, :complex, :reasoning/);
+  }
+});
+
+for (const category of CATEGORIES) {
+  test(`:${category} sticks across new prompts, survives restoration, and bypasses even a broken classifier`, async () => {
+    const h = harness(config(), () => { throw new Error("Classifier must not run"); });
+    h.models.delete("classify/chat");
+    const first = await h.route(request({ messages: [user(`:${category} Do work`)] }), h.ctx);
+    assert.equal(first.model.provider, category);
+    assert.equal(getRoutingMode(h.ctx, "auto"), category);
+    const next = await createRouter(config(), h.pi)(request({ state: first.state }), h.ctx);
+    assert.equal(next.model.provider, category);
+    assert.equal(h.calls.length, 0);
+    assert.equal(h.warnings.length, 0);
+    assert.match(h.statuses.at(-1)[1], new RegExp(`^${category.toUpperCase()} ->`));
+    assert.equal(h.branch.length, 1);
+    assert.equal(JSON.stringify(h.branch).includes("\\u001b"), false);
+  });
+}
+
+test(":auto clears a lock, strips only the classifier's current marker, and stays automatic", async () => {
+  const h = harness(config(), response("simple"));
+  const locked = await h.route(request({ messages: [user(":complex Do work")] }), h.ctx);
+  const resetMessages = [user(":auto Classify this")];
+  const reset = await h.route(request({ state: locked.state, messages: resetMessages }), h.ctx);
+  assert.equal(reset.model.provider, "simple");
+  assert.equal(getRoutingMode(h.ctx, "auto"), "auto");
+  assert.equal(JSON.parse(h.calls[0].context.messages[0].content).currentPrompt, "Classify this");
+  assert.equal(resetMessages[0].content, ":auto Classify this");
+  await h.route(request({ state: reset.state }), h.ctx);
+  assert.equal(h.calls.length, 2);
+});
+
+test("only directives in the new user batch change mode; the last directive wins", async () => {
+  const h = harness();
+  const messages = [user(":reasoning old"), response(), user(":complex next"), user("Also tests")];
+  const routed = await h.route(request({ messages }), h.ctx);
+  assert.equal(routed.model.provider, "complex");
+  const next = await h.route(request({ state: routed.state, messages: [
+    ...messages, response(), user(":simple smaller"), user(":reasoning analyze"), user("And compare"),
+  ] }), h.ctx);
+  assert.equal(next.model.provider, "reasoning");
+  setRoutingMode(h.pi, h.ctx, "auto", "auto");
+  await h.route(request({ messages: [...messages, response(), user("No directive")] }), h.ctx);
+  assert.equal(getRoutingMode(h.ctx, "auto"), "auto");
+  assert.equal(h.calls.length, 1);
+});
+
+test("mode follows the branch and router ID, not the last classified category or abandoned entries", () => {
+  const h = harness();
+  assert.equal(getRoutingMode(h.ctx, "auto"), "auto");
+  setRoutingMode(h.pi, h.ctx, "auto", "complex");
+  const fork = structuredClone(h.branch);
+  setRoutingMode(h.pi, h.ctx, "fast", "simple");
+  setRoutingMode(h.pi, h.ctx, "auto", "auto");
+  assert.equal(getRoutingMode(h.ctx, "auto"), "auto");
+  assert.equal(getRoutingMode(h.ctx, "fast"), "simple");
+  const restored = harness(config(), response(), "auto", fork);
+  assert.equal(getRoutingMode(restored.ctx, "auto"), "complex");
+  assert.equal(getRoutingMode(restored.ctx, "fast"), "auto");
+  h.branch.length = 0;
+  assert.equal(getRoutingMode(h.ctx, "auto"), "auto");
+  h.branch.push({ type: "custom", customType: MODE_ENTRY, data: { id: "auto", mode: "invalid" } });
+  assert.throws(() => getRoutingMode(h.ctx, "auto"), /invalid saved mode/);
+});
+
+test("bad prefixes do not classify, leak their text, or change the current mode", async () => {
+  const h = harness();
+  setRoutingMode(h.pi, h.ctx, "auto", "complex");
+  await assert.rejects(h.route(request({ messages: [user(":simple valid"), user(":SECRET invalid")] }), h.ctx), (error) => {
+    assert.ok(!error.message.includes("SECRET"));
+    return true;
+  });
+  assert.equal(getRoutingMode(h.ctx, "auto"), "complex");
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.warnings.length, 0);
+});
+
+test("forced target failures keep the selected mode and never classify or substitute", async () => {
+  for (const failure of ["missing", "auth", "virtual"]) {
+    const settings = config();
+    const h = harness(settings);
+    const key = `complex/${settings.routes.complex.model}`;
+    if (failure === "missing") h.models.delete(key);
+    if (failure === "auth") h.ctx.modelRegistry.hasConfiguredAuth = (model) => model.provider !== "complex";
+    if (failure === "virtual") h.models.get(key).api = "pi-virtual";
+    await assert.rejects(h.route(request({ messages: [user(":complex work")] }), h.ctx), /pi-auto-router:/);
+    assert.equal(getRoutingMode(h.ctx, "auto"), "complex");
+    assert.equal(h.calls.length, 0);
+    assert.equal(h.warnings.length, 0);
+  }
+});
+
+test("routing-error retries cannot substitute the previous turn's target for a forced tier", async () => {
+  const settings = config();
+  const h = harness(settings);
+  const previous = await h.route(request(), h.ctx);
+  const key = `complex/${settings.routes.complex.model}`;
+  const model = h.models.get(key);
+  h.models.delete(key);
+  const messages = [user(":complex work")];
+  await assert.rejects(h.route(request({ messages, state: previous.state }), h.ctx), /not in Pi's chat catalog/);
+  await assert.rejects(h.route(request({ reason: "retry", messages, state: previous.state }), h.ctx), /not in Pi's chat catalog/);
+  h.models.set(key, model);
+  const recovered = await h.route(request({ reason: "retry", messages, state: previous.state }), h.ctx);
+  assert.equal(recovered.model.provider, "complex");
+  assert.equal(h.calls.length, 1);
+});
+
+test("standalone mode switches cannot reroute an in-flight turn, retries or direct requests", async () => {
+  const h = harness();
+  const first = await h.route(request({ messages: [user(":complex work")] }), h.ctx);
+  setRoutingMode(h.pi, h.ctx, "auto", "simple");
+  for (const reason of ["continuation", "retry"]) {
+    const next = await h.route(request({ reason, state: first.state, messages: [user(":reasoning ignored"), response()] }), h.ctx);
+    assert.equal(next.model.provider, "complex");
+    assert.equal(getRoutingMode(h.ctx, "auto"), "simple");
+  }
+  const previous = { model: first.model, thinkingLevel: first.thinkingLevel };
+  assert.deepEqual(await h.route(request({ reason: "direct", previous }), h.ctx), previous);
+  assert.deepEqual(await h.route(request({ reason: "retry", failed: previous }), h.ctx), previous);
+  assert.equal((await h.route(request(), h.ctx)).model.provider, "simple");
+  assert.equal(h.calls.length, 0);
+});
+
+test("forced status is uppercase, bold and orange only in TUI; auto stays muted", () => {
+  const h = harness();
+  const styles = [];
+  h.ctx.mode = "tui";
+  h.ctx.ui.theme = {
+    appearance: "dark",
+    style: (text, options) => { styles.push({ text, options }); return `<style>${text}</style>`; },
+    fg: (token, text) => `<${token}>${text}</${token}>`,
+  };
+  setRouterStatus(h.ctx, "complex", "complex", config().routes.complex);
+  assert.match(h.statuses.at(-1)[1], /^<style>COMPLEX<\/style> ->/);
+  assert.deepEqual(styles[0], { text: "COMPLEX", options: { fg: { kind: "rgb", r: 255, g: 165, b: 0 }, bold: true } });
+  setRouterStatus(h.ctx, "auto", "complex", config().routes.complex);
+  assert.match(h.statuses.at(-1)[1], /^<muted>auto<\/muted> -> complex ->/);
+  h.ctx.ui.theme.appearance = "light";
+  setRouterStatus(h.ctx, "reasoning");
+  assert.deepEqual(styles.at(-1).options.fg, { kind: "rgb", r: 166, g: 82, b: 0 });
+  h.ctx.mode = "rpc";
+  setRouterStatus(h.ctx, "simple");
+  assert.equal(h.statuses.at(-1)[1], "SIMPLE");
+});
 
 test("off thinking is represented by omitting provider-neutral reasoning", async () => {
   const settings = config();
@@ -294,6 +455,82 @@ test("multiple-model config validates every router and supports old single-route
   assert.throws(() => validateModelsConfig({ models: { fast: {} } }), /models.fast/);
 });
 
+test("input controls handle bare switches, defer queued prefixes, preserve images and restore lifecycle status", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-auto-router-input-"));
+  const originalEnv = process.env.PI_AUTO_ROUTER_CONFIG;
+  const originalArgv = process.argv;
+  t.after(() => {
+    process.argv = originalArgv;
+    if (originalEnv === undefined) delete process.env.PI_AUTO_ROUTER_CONFIG;
+    else process.env.PI_AUTO_ROUTER_CONFIG = originalEnv;
+    rmSync(dir, { recursive: true });
+  });
+  const path = join(dir, "config.json");
+  writeFileSync(path, JSON.stringify({ models: { auto: config(), fast: config() } }));
+  process.env.PI_AUTO_ROUTER_CONFIG = path;
+  process.argv = ["node", "pi"];
+  const h = harness();
+  const handlers = new Map();
+  const definitions = new Map();
+  Object.assign(h.pi, {
+    registerFlag() {}, getFlag() {},
+    on: (event, handler) => handlers.set(event, handler),
+    registerVirtualModel: (definition) => definitions.set(definition.id, definition),
+  });
+  extension(h.pi);
+  const input = (text, extra = {}) => handlers.get("input")({ text, ...extra }, h.ctx);
+  const refresh = (event) => handlers.get(event)({}, h.ctx);
+  refresh("session_start");
+  assert.equal(h.statuses.at(-1)[1], "auto");
+  assert.deepEqual(input(":complex"), { action: "handled" });
+  assert.equal(h.statuses.at(-1)[1], "COMPLEX");
+  assert.equal(getRoutingMode(h.ctx, "auto"), "complex");
+  assert.equal(h.calls.length, 0);
+  const snapshot = structuredClone(h.branch);
+  assert.deepEqual(input(":simple queued task", { streamingBehavior: "followUp" }), { action: "continue" });
+  assert.deepEqual(h.branch, snapshot);
+  await assert.rejects(definitions.get("auto").route(request({
+    messages: [user(":simple cancelled")], signal: AbortSignal.abort(new Error("cancelled")),
+  }), h.ctx), /cancelled/);
+  assert.deepEqual(h.branch, snapshot);
+  const delivered = await definitions.get("auto").route(request({ messages: [user(":simple queued task")] }), h.ctx);
+  assert.equal(delivered.model.provider, "simple");
+  assert.equal(getRoutingMode(h.ctx, "auto"), "simple");
+  assert.deepEqual(input(":auto", { images: [{ type: "image", data: "img" }] }), { action: "continue" });
+  assert.equal(getRoutingMode(h.ctx, "auto"), "simple");
+  assert.deepEqual(input(":SECRET task"), { action: "handled" });
+  assert.equal(h.warnings.at(-1)[1], "error");
+  assert.ok(!h.warnings.at(-1)[0].includes("SECRET"));
+  assert.equal(getRoutingMode(h.ctx, "auto"), "simple");
+  h.ctx.hasUI = false;
+  assert.deepEqual(input(":SECRET task"), { action: "continue" });
+  await assert.rejects(definitions.get("auto").route(request({ messages: [user(":SECRET task")] }), h.ctx), /unknown tier/);
+  h.ctx.hasUI = true;
+  h.ctx.model.id = "fast";
+  refresh("model_select");
+  assert.equal(h.statuses.at(-1)[1], "auto");
+  input(":reasoning");
+  assert.equal(getRoutingMode(h.ctx, "fast"), "reasoning");
+  h.ctx.model = { provider: "physical", id: "model" };
+  assert.deepEqual(input(":SECRET"), { action: "continue" });
+  refresh("model_select");
+  assert.equal(h.statuses.at(-1)[1], undefined);
+  h.ctx.model = { provider: "autorouter", id: "auto" };
+  h.branch.splice(0, h.branch.length, ...snapshot);
+  refresh("session_tree");
+  assert.equal(h.statuses.at(-1)[1], "COMPLEX");
+  h.branch.length = 0;
+  refresh("session_start");
+  assert.equal(h.statuses.at(-1)[1], "auto");
+  h.branch.push(...snapshot);
+  extension(h.pi);
+  refresh("session_start");
+  assert.equal(h.statuses.at(-1)[1], "COMPLEX");
+  input(":auto");
+  assert.equal(h.statuses.at(-1)[1], "auto");
+  assert.equal(h.calls.length, 0);
+});
+
 test("extension registers independent routers at startup; CLI overrides env; invalid config fails loading", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "pi-auto-router-"));
   const originalEnv = process.env.PI_AUTO_ROUTER_CONFIG;
@@ -321,6 +558,7 @@ test("extension registers independent routers at startup; CLI overrides env; inv
   const definitions = new Map();
   let flag;
   const pi = {
+    on: () => {},
     registerFlag: (name, options) => { flag = { name, ...options }; },
     getFlag: () => undefined,
     registerVirtualModel: (value) => { definitions.set(value.id, value); },

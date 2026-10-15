@@ -49,3 +49,42 @@ if [[ "$result" != "router-smoke/medium:medium" ]]; then
   exit 1
 fi
 printf 'PASS: legacy config via env -> %s\n' "$result"
+
+run_sticky() {
+  (cd "$tmp" && ROUTER_SMOKE_CALL_LOG="$tmp/calls.log" PI_CODING_AGENT_DIR="$tmp/agent" pi --offline \
+    --no-extensions --no-mcp --no-skills --no-prompt-templates --no-context-files \
+    --no-tools -e "$root/test/fixtures/mock-provider.js" -e "$root" \
+    --auto-router-config "$tmp/config.json" --model autorouter/auto \
+    --session "$tmp/sticky.jsonl" -p "$1")
+}
+check_sticky() {
+  local prompt="$1" expected="$2" expected_calls="$3" output calls
+  : > "$tmp/calls.log"
+  output="$(run_sticky "$prompt")"
+  calls="$(paste -sd, "$tmp/calls.log")"
+  if [[ "$calls" != "$expected_calls" || ( -n "$expected" && "$output" != "$expected" ) ]]; then
+    printf 'FAIL: %s expected %s [%s], got %s [%s]\n' "$prompt" "$expected" "$expected_calls" "$output" "$calls" >&2
+    exit 1
+  fi
+  # Pi print mode replays the previous answer after handled input; the call log proves no model ran.
+  printf 'PASS: %s -> %s (saved session; calls: %s)\n' "$prompt" "${expected:-no model call}" "${calls:-none}"
+}
+check_sticky ':complex Do a task' 'router-smoke/complex:high' 'complex'
+check_sticky 'reasoning' 'router-smoke/complex:high' 'complex'
+check_sticky ':simple' '' ''
+check_sticky 'complex' 'router-smoke/simple:low' 'simple'
+check_sticky ':auto reasoning' 'router-smoke/reasoning:xhigh' 'classifier,reasoning'
+check_sticky 'simple' 'router-smoke/simple:low' 'classifier,simple'
+check_sticky ':complex' '' ''
+check_sticky ':auto' '' ''
+check_sticky 'reasoning' 'router-smoke/reasoning:xhigh' 'classifier,reasoning'
+: > "$tmp/calls.log"
+if run_sticky ':typo Do a task' > "$tmp/invalid.out" 2> "$tmp/invalid.err"; then
+  printf 'FAIL: unknown tier should fail in print mode\n' >&2
+  exit 1
+fi
+if ! grep -q 'unknown tier' "$tmp/invalid.err" || [[ -s "$tmp/calls.log" ]]; then
+  printf 'FAIL: unknown tier should report an error without calling models\n' >&2
+  exit 1
+fi
+printf 'PASS: unknown tier fails explicitly in print mode (no model calls)\n'

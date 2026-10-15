@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 
 export const CATEGORIES = ["simple", "medium", "complex", "reasoning"];
+export const MODE_ENTRY = "pi-auto-router-mode";
+const MODES = ["auto", ...CATEGORIES];
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const DEFAULTS = {
   fallbackCategory: "medium",
@@ -103,6 +105,42 @@ function textContent(message) {
   return (message.content ?? []).flatMap((block) => block.type === "text" ? [block.text] : []).join("\n");
 }
 
+export function parseTierPrefix(text) {
+  const match = /^\s*:([^\s]+)(?:\s+|$)/.exec(text);
+  if (!match) return undefined;
+  if (!MODES.includes(match[1])) {
+    throw new Error(`Auto router: unknown tier. Use ${MODES.map((mode) => `:${mode}`).join(", ")}.`);
+  }
+  return { mode: match[1], text: text.slice(match[0].length) };
+}
+
+export function getRoutingMode(ctx, id) {
+  const entry = ctx.sessionManager.getBranch().findLast((entry) =>
+    entry.type === "custom" && entry.customType === MODE_ENTRY && entry.data?.id === id);
+  if (!entry) return "auto";
+  if (!MODES.includes(entry.data.mode)) throw new Error("pi-auto-router: invalid saved mode");
+  return entry.data.mode;
+}
+
+export function setRoutingMode(pi, ctx, id, mode) {
+  if (!MODES.includes(mode)) throw new Error("pi-auto-router: invalid mode");
+  if (getRoutingMode(ctx, id) !== mode) pi.appendEntry(MODE_ENTRY, { id, mode });
+}
+
+export function setRouterStatus(ctx, mode, category, target) {
+  let label = mode === "auto" ? "auto" : mode.toUpperCase();
+  if (ctx.mode === "tui") {
+    const theme = ctx.ui.theme;
+    const orange = theme.appearance === "light"
+      ? { kind: "rgb", r: 166, g: 82, b: 0 }
+      : { kind: "rgb", r: 255, g: 165, b: 0 };
+    label = mode === "auto" ? theme.fg("muted", label) : theme.style(label, { fg: orange, bold: true });
+  }
+  if (mode === "auto" && category) label += ` -> ${category}`;
+  if (target) label += ` -> ${target.provider}/${target.model} (${target.thinkingLevel})`;
+  ctx.ui.setStatus("pi-auto-router", label);
+}
+
 function boundedPrompt(text, limit) {
   if (text.length <= limit) return text;
   const marker = "\n[... prompt truncated ...]\n";
@@ -127,7 +165,7 @@ export function classificationInput(messages, config) {
   }
   return {
     recentConversation: recent,
-    currentPrompt: boundedPrompt(textContent(current), config.maxPromptChars),
+    currentPrompt: boundedPrompt(parseTierPrefix(textContent(current))?.text ?? textContent(current), config.maxPromptChars),
     imageCount: Array.isArray(current.content) ? current.content.filter((block) => block.type === "image").length : 0,
   };
 }
@@ -188,7 +226,7 @@ async function classify(request, ctx, config) {
   }
 }
 
-export function createRouter(config) {
+export function createRouter(config, pi, id = "auto") {
   return async function route(request, ctx) {
     request.signal?.throwIfAborted();
     // Retried requests use the exact failed pair, including Pi's clamped thinking level.
@@ -200,7 +238,11 @@ export function createRouter(config) {
       const target = config.routes[config.fallbackCategory];
       return { model: resolveTarget(target, ctx.modelRegistry), thinkingLevel: target.thinkingLevel };
     }
-    if (request.reason !== "user") {
+    const lastAssistant = request.messages.findLastIndex((message) => message.role === "assistant");
+    const pendingUsers = request.messages.slice(lastAssistant + 1).filter((message) => message.role === "user");
+    // An unresolved forced user turn must not retry on the previous turn's saved target.
+    const retryingManualUser = request.reason === "retry" && pendingUsers.length > 0 && getRoutingMode(ctx, id) !== "auto";
+    if (request.reason !== "user" && !retryingManualUser) {
       if (request.state) {
         const target = validateTarget(request.state.target, "router state target");
         return { model: resolveTarget(target, ctx.modelRegistry), thinkingLevel: target.thinkingLevel };
@@ -209,19 +251,29 @@ export function createRouter(config) {
       const target = config.routes[config.fallbackCategory];
       return { model: resolveTarget(target, ctx.modelRegistry), thinkingLevel: target.thinkingLevel };
     }
-    let category;
-    try {
-      category = await classify(request, ctx, config);
-    } catch {
-      request.signal?.throwIfAborted();
-      category = config.fallbackCategory;
-      // Do not leak provider responses or prompt text into notifications.
-      ctx.ui.notify(`Auto router: classification failed; using ${category}. Check classifier configuration, credentials, or timeout.`, "warning");
+    // A queued batch may contain several user messages; validate all before committing its last switch.
+    const prefixes = pendingUsers.map((message) => parseTierPrefix(textContent(message)));
+    const prefix = prefixes.findLast((value) => value !== undefined);
+    const mode = prefix?.mode ?? getRoutingMode(ctx, id);
+    if (prefix) {
+      setRoutingMode(pi, ctx, id, mode);
+      setRouterStatus(ctx, mode);
+    }
+    let category = mode;
+    if (mode === "auto") {
+      try {
+        category = await classify(request, ctx, config);
+      } catch {
+        request.signal?.throwIfAborted();
+        category = config.fallbackCategory;
+        // Do not leak provider responses or prompt text into notifications.
+        ctx.ui.notify(`Auto router: classification failed; using ${category}. Check classifier configuration, credentials, or timeout.`, "warning");
+      }
     }
     request.signal?.throwIfAborted();
     const target = config.routes[category];
     const model = resolveTarget(target, ctx.modelRegistry);
-    ctx.ui.setStatus("pi-auto-router", `${category} -> ${target.provider}/${target.model} (${target.thinkingLevel})`);
+    setRouterStatus(ctx, mode, category, target);
     return { model, thinkingLevel: target.thinkingLevel, state: { category, target: { ...target } } };
   };
 }

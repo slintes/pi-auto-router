@@ -2,7 +2,8 @@
 
 A Pi extension that registers multiple virtual models under **`autorouter`**.
 Each uses a normal chat LLM to classify new user prompts, then dispatches them
-to its own configured models and thinking levels.
+to its own configured models and thinking levels. Use a short `:tier` prefix to
+select a sticky tier instead of automatic classification.
 No Jev, Decisions API, extra service, build step, or runtime dependencies.
 Built against Pi 1.1.0's `registerVirtualModel` API.
 
@@ -134,10 +135,59 @@ The CLI flag supports both `--auto-router-config path` and
 `--auto-router-config=path`. During startup, it is read from process arguments
 because Pi applies extension flag values after factories have run.
 
+## Manual tier controls
+
+Every fresh session starts in **auto** mode. Prefix a prompt with a tier to select
+it for that prompt and all subsequent user messages until you choose another mode:
+
+```text
+:complex Refactor the authentication flow.
+Now update the tests.                      (still complex)
+:reasoning Compare these two approaches.   (switches to reasoning)
+:auto Fix this typo.                       (automatic routing resumes immediately)
+```
+
+Controls: `:simple`, `:medium`, `:complex`, `:reasoning`, and `:auto`.
+They are lowercase, exact tokens at the start of a prompt (leading whitespace is
+allowed), followed by whitespace or the end of the message. A bare control such
+as `:complex` or `:auto` changes mode without calling any model. Unknown leading
+`:name` controls report an error and leave the mode unchanged; occurrences inside
+a prompt, prose headings such as `complex:`, and fenced code are not controls.
+In print mode (`-p`), Pi may repeat the previous assistant answer after a bare
+control; this is a display behavior, not a new model call.
+
+- Manual mode bypasses the classifier entirely. It selects the configured tier
+  in the **currently selected router**, not a different virtual model. Each router
+  keeps its own mode on the active session branch.
+- A prefix attached to a prompt takes effect when Pi processes that prompt, not
+  when it is queued. Removing or cancelling an undelivered queued prompt does not
+  change mode. If Pi delivers multiple user messages together, the last control
+  in that batch wins.
+- Bare controls take effect immediately, including while Pi is working. They
+  affect subsequent user requests, not the physical model already handling the
+  current turn's tool chain or retry. Queued prompts use the mode active when
+  processed, unless they carry their own prefix.
+- `/new` starts in auto. Resume, reload, compaction, forks, and session-tree
+  navigation preserve the mode recorded on that branch. Older sessions without
+  a saved mode start in auto. Switching to a physical model hides the router
+  status and leaves that router's saved mode intact.
+- The status shows forced tiers in **bold, uppercase orange**, without a
+  "locked" label. Auto mode is muted and chosen categories stay lowercase.
+  Only the mode name is emphasized. Non-TUI modes use plain text.
+- Prefixes remain in the task prompt and conversation history. The classifier's
+  current prompt omits `:auto`; recent conversation can still contain prefixes.
+  Mode entries store plain data, never terminal styling.
+
+A forced tier with an unavailable model or missing credentials fails explicitly;
+it never silently falls back or re-enables auto. The selected mode remains saved,
+so you can fix credentials or select `:auto`/another tier. This feature does not
+change `/plan` mode or tool permissions.
+
 ## Routing contract
 
-1. Every new user message, including steering/follow-up messages, gets a new
-   classification. Unlike Jev's example, routing is not locked for the session.
+1. In auto mode, every new user message, including steering/follow-up messages,
+   gets a new classification. Manual mode reuses the selected tier until changed.
+   Automatically chosen categories never become sticky modes.
 2. The classifier receives a system instruction and a JSON payload containing
    the bounded current prompt, bounded recent conversation text, and an image
    count. It has **no tools** and does not receive the main system prompt,
@@ -146,8 +196,9 @@ because Pi applies extension flag values after factories have run.
    Strict JSON is required; a single JSON Markdown fence is also accepted.
 4. The chosen physical provider/model/thinking triple is persisted in Pi's
    branch-local router state. Tool continuations reuse it, even after resume,
-   compaction, or reload. Automatic retries reuse the failed physical pair;
-   routing failures without a failed pair reuse stored state.
+   compaction, or reload. Automatic retries reuse the failed physical pair.
+   Routing failures without a failed pair reuse stored state, except unresolved
+   manual user turns retry the forced tier rather than substitute an old target.
 5. Direct requests such as compaction use the previous physical model when
    available, otherwise the fallback category. They are not classified and
    do not change branch routing state.
@@ -163,7 +214,8 @@ Categories:
 
 Large implementation planning is `complex`; `reasoning` is for tasks whose
 main deliverable is analysis. This is an LLM judgment, not a guarantee.
-The footer shows the physical dispatch; a status line also shows the category.
+The footer shows the physical dispatch; a status line also shows the routing mode
+and, after an automatic dispatch, the chosen category.
 Routing does **not** turn on `/plan` mode or change any tool permissions.
 
 ## Failures, privacy, and cost
@@ -174,12 +226,12 @@ Routing does **not** turn on `/plan` mode or change any tool permissions.
 - User cancellation propagates; it never causes a fallback completion.
 - Missing route models/credentials and virtual-model targets fail the request
   explicitly. There is no silent target substitution or cross-provider retry.
-- Text is sent to the **classifier provider as well as the chosen task provider**.
-  Recent assistant answers can contain sensitive data. Set `contextChars` to 0
+- In auto mode, text is sent to the **classifier provider as well as the chosen
+  task provider**. Recent assistant answers can contain sensitive data. Set `contextChars` to 0
   or choose a trusted/local classifier if needed. Prompt instructions cannot
   make an LLM classifier immune to prompt injection.
-- Classification adds a paid chat request and latency for each new user prompt.
-  Classifier output has a 2048-token cap; unusually heavy classifier thinking
+- In auto mode, classification adds a paid chat request and latency for each new
+  user prompt. Classifier output has a 2048-token cap; unusually heavy classifier thinking
   can exhaust it and trigger fallback. A fast model with low thinking is best.
 - Classifier calls are out-of-band; do not assume Pi's session cost includes
   them. Provider billing does. Switching task models can lose prompt-cache reuse.
@@ -199,8 +251,10 @@ Tests use Node's built-in runner and fake Pi model registries; no installs,
 credentials, or billed requests are required. They cover validation, parsing,
 context bounds, each route, failures, cancellation, timeout, sticky turns,
 retry/direct behavior, persisted state, independent routers, legacy config,
-and startup config selection.
+startup config selection, sticky tier controls, standalone switches, queued
+prefixes, branch restoration, target failures, and status styling.
 The smoke script additionally starts real Pi CLI processes against a mock
 in-process chat provider, verifying both virtual models, all four routes,
-thinking levels, package loading, and CLI config precedence. It uses isolated temporary Pi settings
+thinking levels, package loading, CLI config precedence, and sticky controls
+across saved-session resumes. It uses isolated temporary Pi settings
 and makes no network or paid model requests.

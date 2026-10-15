@@ -1,3 +1,4 @@
+import { appendFileSync } from "node:fs";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 
 export default function mockProvider(pi) {
@@ -10,6 +11,7 @@ export default function mockProvider(pi) {
       maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     })),
     streamSimple(model, context, options) {
+      if (process.env.ROUTER_SMOKE_CALL_LOG) appendFileSync(process.env.ROUTER_SMOKE_CALL_LOG, `${model.id}\n`);
       const stream = createAssistantMessageEventStream();
       queueMicrotask(() => {
         const last = context.messages.filter((message) => message.role === "user").at(-1);
