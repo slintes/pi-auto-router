@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { createRouter, getRoutingMode, loadConfig, parseTierPrefix, setRoutingMode, setRouterStatus } from "./router.js";
+import { CATEGORIES, createRouter, getRoutingMode, loadConfig, parseTierPrefix, setRoutingMode, setRouterStatus } from "./router.js";
 
 export default function autoRouter(pi) {
   pi.registerFlag("auto-router-config", {
@@ -29,17 +29,26 @@ export default function autoRouter(pi) {
       route: createRouter(settings, pi, id),
     });
   }
-  function refreshStatus(_event, ctx) {
+  function refreshStatus(event, ctx) {
     const id = ctx.model?.id;
     if (ctx.model?.provider !== "autorouter" || !Object.hasOwn(config.models, id)) {
       ctx.ui.setStatus("pi-auto-router", undefined);
+      if (ctx.mode === "tui") ctx.ui.setWidget("pi-auto-router-hint", undefined);
       return;
     }
     const mode = getRoutingMode(ctx, id);
     setRouterStatus(ctx, mode);
+    if (ctx.hasUI && (event.type === "session_start" ||
+      (event.type === "model_select" && event.source !== "restore" && event.previousModel?.provider !== "autorouter"))) {
+      const hint = `Auto router: ${["auto", ...CATEGORIES].map((mode) => `:${mode}`).join(" ")} — prefix a prompt or send alone (sticky).`;
+      // Pi's own model-switch status replaces info notifications before they render.
+      if (ctx.mode === "tui") ctx.ui.setWidget("pi-auto-router-hint", [ctx.ui.theme.italic(hint)]);
+      else ctx.ui.notify(hint, "info");
+    }
   }
   for (const event of ["session_start", "session_tree", "model_select"]) pi.on(event, refreshStatus);
   pi.on("input", (event, ctx) => {
+    if (ctx.mode === "tui") ctx.ui.setWidget("pi-auto-router-hint", undefined);
     const id = ctx.model?.id;
     if (ctx.model?.provider !== "autorouter" || !Object.hasOwn(config.models, id)) return { action: "continue" };
     let prefix;

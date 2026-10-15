@@ -137,6 +137,14 @@ because Pi applies extension flag values after factories have run.
 
 ## Manual tier controls
 
+When a session starts with `autorouter` selected (including resume and reload),
+or you switch to it from another provider, Pi shows a short hint listing all
+`:mode` controls and how to use them. In the terminal, it appears in italics above the editor
+until your next submitted input or a switch away from `autorouter`; it cannot be
+overwritten by Pi's model-switch status. RPC clients receive an info notification.
+The hint is UI-only: it is not added to model context, and it does not repeat for
+ordinary prompts, tree navigation, or switches between routers within `autorouter`.
+
 Every fresh session starts in **auto** mode. Prefix a prompt with a tier to select
 it for that prompt and all subsequent user messages until you choose another mode:
 
@@ -252,7 +260,7 @@ credentials, or billed requests are required. They cover validation, parsing,
 context bounds, each route, failures, cancellation, timeout, sticky turns,
 retry/direct behavior, persisted state, independent routers, legacy config,
 startup config selection, sticky tier controls, standalone switches, queued
-prefixes, branch restoration, target failures, and status styling.
+prefixes, branch restoration, target failures, status styling, and activation hints.
 The smoke script additionally starts real Pi CLI processes against a mock
 in-process chat provider, verifying both virtual models, all four routes,
 thinking levels, package loading, CLI config precedence, and sticky controls

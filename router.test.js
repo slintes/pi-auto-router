@@ -28,6 +28,7 @@ function harness(configuration = config(), result = response(), id = "auto", bra
   const calls = [];
   const warnings = [];
   const statuses = [];
+  const widgets = new Map();
   const pi = { appendEntry: (customType, data) => branch.push({ type: "custom", customType, data: structuredClone(data) }) };
   const ctx = {
     mode: "rpc", hasUI: true,
@@ -41,9 +42,12 @@ function harness(configuration = config(), result = response(), id = "auto", bra
         return { result: () => typeof result === "function" ? result(options) : Promise.resolve(result) };
       },
     },
-    ui: { notify: (...args) => warnings.push(args), setStatus: (...args) => statuses.push(args) },
+    ui: {
+      notify: (...args) => warnings.push(args), setStatus: (...args) => statuses.push(args),
+      setWidget: (key, content) => content === undefined ? widgets.delete(key) : widgets.set(key, content),
+    },
   };
-  return { ctx, pi, branch, models, calls, warnings, statuses, route: createRouter(configuration, pi, id) };
+  return { ctx, pi, branch, models, calls, warnings, statuses, widgets, route: createRouter(configuration, pi, id) };
 }
 function request(overrides = {}) {
   return { reason: "user", thinkingLevel: "off", messages: [user()], ...overrides };
@@ -479,10 +483,68 @@ test("input controls handle bare switches, defer queued prefixes, preserve image
   });
   extension(h.pi);
   const input = (text, extra = {}) => handlers.get("input")({ text, ...extra }, h.ctx);
-  const refresh = (event) => handlers.get(event)({}, h.ctx);
+  const refresh = (event, extra = {}) => handlers.get(event)({ type: event, ...extra }, h.ctx);
+  const hint = ["Auto router: :auto :simple :medium :complex :reasoning — prefix a prompt or send alone (sticky).", "info"];
+  for (const reason of ["startup", "new", "resume", "fork", "reload"]) {
+    h.warnings.length = 0;
+    refresh("session_start", { reason });
+    assert.deepEqual(h.warnings, [hint]);
+    assert.equal(h.statuses.at(-1)[1], "auto");
+  }
+  for (const source of ["set", "cycle"]) {
+    h.warnings.length = 0;
+    refresh("model_select", { previousModel: { provider: "physical", id: "model" }, source });
+    assert.deepEqual(h.warnings, [hint]);
+  }
+  h.warnings.length = 0;
+  refresh("session_tree");
+  refresh("model_select", { previousModel: { provider: "autorouter", id: "fast" }, source: "set" });
+  refresh("model_select", { previousModel: { provider: "physical", id: "model" }, source: "restore" });
+  assert.deepEqual(h.warnings, []);
+  for (const model of [undefined, { provider: "physical", id: "model" }, { provider: "autorouter", id: "unknown" }]) {
+    h.ctx.model = model;
+    refresh("session_start");
+    refresh("model_select", { previousModel: { provider: "physical", id: "model" }, source: "set" });
+    assert.deepEqual(h.warnings, []);
+  }
+  h.ctx.model = { provider: "autorouter", id: "auto" };
+  for (const mode of ["print", "json"]) {
+    h.ctx.mode = mode;
+    h.ctx.hasUI = false;
+    refresh("session_start");
+    refresh("model_select", { previousModel: { provider: "physical", id: "model" }, source: "set" });
+    assert.deepEqual(h.warnings, []);
+  }
+  h.ctx.mode = "tui";
+  h.ctx.hasUI = true;
+  h.ctx.ui.theme = {
+    fg: (_color, text) => text, style: (text) => text,
+    italic: (text) => `<italic>${text}</italic>`,
+  };
+  const italicHint = `<italic>${hint[0]}</italic>`;
   refresh("session_start");
-  assert.equal(h.statuses.at(-1)[1], "auto");
+  assert.deepEqual(h.widgets.get("pi-auto-router-hint"), [italicHint]);
+  assert.deepEqual(h.warnings, []);
+  let uiStatus = "";
+  h.ctx.ui.notify = (text) => { uiStatus = text; };
+  refresh("model_select", { previousModel: { provider: "physical", id: "model" }, source: "set" });
+  h.ctx.ui.notify("Model: auto", "info");
+  assert.equal(uiStatus, "Model: auto");
+  assert.deepEqual(h.widgets.get("pi-auto-router-hint"), [italicHint]);
+  assert.deepEqual(input("Next prompt"), { action: "continue" });
+  assert.equal(h.widgets.has("pi-auto-router-hint"), false);
+  refresh("model_select", { previousModel: { provider: "physical", id: "model" }, source: "set" });
+  assert.equal(h.widgets.has("pi-auto-router-hint"), true);
+  h.ctx.model = { provider: "physical", id: "model" };
+  refresh("model_select", { previousModel: { provider: "autorouter", id: "auto" }, source: "set" });
+  assert.equal(h.widgets.has("pi-auto-router-hint"), false);
+  h.ctx.model = { provider: "autorouter", id: "auto" };
+  h.ctx.ui.notify = (...args) => h.warnings.push(args);
+  h.ctx.mode = "rpc";
+  assert.deepEqual(h.branch, []);
+  assert.equal(h.calls.length, 0);
   assert.deepEqual(input(":complex"), { action: "handled" });
+  assert.deepEqual(h.warnings, [["Auto router: mode set to complex.", "info"]]);
   assert.equal(h.statuses.at(-1)[1], "COMPLEX");
   assert.equal(getRoutingMode(h.ctx, "auto"), "complex");
   assert.equal(h.calls.length, 0);
