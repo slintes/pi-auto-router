@@ -2,6 +2,11 @@ import { readFileSync } from "node:fs";
 
 export const CATEGORIES = ["simple", "medium", "complex", "reasoning"];
 export const MODE_ENTRY = "pi-auto-router-mode";
+export function isSubagent(pi) {
+  const state = { subagent: false };
+  pi?.events?.emit("pi-auto-router:subagent", state);
+  return state.subagent === true;
+}
 const MODES = ["auto", ...CATEGORIES];
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const DEFAULTS = {
@@ -229,9 +234,16 @@ async function classify(request, ctx, config) {
 export function createRouter(config, pi, id = "auto") {
   return async function route(request, ctx) {
     request.signal?.throwIfAborted();
+    const child = isSubagent(pi);
     // Retried requests use the exact failed pair, including Pi's clamped thinking level.
     if (request.reason === "retry" && request.failed) {
       return { model: request.failed.model, thinkingLevel: request.failed.thinkingLevel ?? "off" };
+    }
+    const sessionId = child ? ctx.sessionManager.getSessionId() : undefined;
+    // A fork gets its own choice; resumes keep the child's original target, not an inherited one.
+    if (child && request.state?.sessionId === sessionId) {
+      const target = validateTarget(request.state.target, "router state target");
+      return { model: resolveTarget(target, ctx.modelRegistry), thinkingLevel: target.thinkingLevel };
     }
     if (request.reason === "direct") {
       if (request.previous) return { model: request.previous.model, thinkingLevel: request.previous.thinkingLevel ?? "off" };
@@ -241,8 +253,8 @@ export function createRouter(config, pi, id = "auto") {
     const lastAssistant = request.messages.findLastIndex((message) => message.role === "assistant");
     const pendingUsers = request.messages.slice(lastAssistant + 1).filter((message) => message.role === "user");
     // An unresolved forced user turn must not retry on the previous turn's saved target.
-    const retryingManualUser = request.reason === "retry" && pendingUsers.length > 0 && getRoutingMode(ctx, id) !== "auto";
-    if (request.reason !== "user" && !retryingManualUser) {
+    const retryingManualUser = !child && request.reason === "retry" && pendingUsers.length > 0 && getRoutingMode(ctx, id) !== "auto";
+    if (!child && request.reason !== "user" && !retryingManualUser) {
       if (request.state) {
         const target = validateTarget(request.state.target, "router state target");
         return { model: resolveTarget(target, ctx.modelRegistry), thinkingLevel: target.thinkingLevel };
@@ -252,9 +264,9 @@ export function createRouter(config, pi, id = "auto") {
       return { model: resolveTarget(target, ctx.modelRegistry), thinkingLevel: target.thinkingLevel };
     }
     // A queued batch may contain several user messages; validate all before committing its last switch.
-    const prefixes = pendingUsers.map((message) => parseTierPrefix(textContent(message)));
+    const prefixes = child ? [] : pendingUsers.map((message) => parseTierPrefix(textContent(message)));
     const prefix = prefixes.findLast((value) => value !== undefined);
-    const mode = prefix?.mode ?? getRoutingMode(ctx, id);
+    const mode = child ? "auto" : prefix?.mode ?? getRoutingMode(ctx, id);
     if (prefix) {
       setRoutingMode(pi, ctx, id, mode);
       setRouterStatus(ctx, mode);
@@ -274,6 +286,7 @@ export function createRouter(config, pi, id = "auto") {
     const target = config.routes[category];
     const model = resolveTarget(target, ctx.modelRegistry);
     setRouterStatus(ctx, mode, category, target);
-    return { model, thinkingLevel: target.thinkingLevel, state: { category, target: { ...target } } };
+    return { model, thinkingLevel: target.thinkingLevel,
+      state: { category, target: { ...target }, ...(child ? { sessionId } : {}) } };
   };
 }

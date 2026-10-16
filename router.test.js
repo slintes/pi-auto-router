@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import extension from "./index.js";
+import subagentExtension from "./subagent.js";
 import { CATEGORIES, MODE_ENTRY, classificationInput, createRouter, getRoutingMode, loadConfig, parseCategory, parseTierPrefix, setRoutingMode, setRouterStatus, validateConfig, validateModelsConfig } from "./router.js";
 
 const modelsExample = JSON.parse(readFileSync(new URL("./config.example.json", import.meta.url), "utf8"));
@@ -33,7 +35,7 @@ function harness(configuration = config(), result = response(), id = "auto", bra
   const ctx = {
     mode: "rpc", hasUI: true,
     model: { provider: "autorouter", id, api: "pi-virtual" },
-    sessionManager: { getBranch: () => branch },
+    sessionManager: { getBranch: () => branch, getSessionId: () => "test-session" },
     modelRegistry: {
       find: (provider, id) => models.get(`${provider}/${id}`),
       hasConfiguredAuth: () => true,
@@ -48,6 +50,12 @@ function harness(configuration = config(), result = response(), id = "auto", bra
     },
   };
   return { ctx, pi, branch, models, calls, warnings, statuses, widgets, route: createRouter(configuration, pi, id) };
+}
+function enableChildRouter(pi) {
+  const listeners = new Map();
+  pi.events = { on: (channel, listener) => listeners.set(channel, listener),
+    emit: (channel, data) => listeners.get(channel)?.(data) };
+  subagentExtension(pi);
 }
 function request(overrides = {}) {
   return { reason: "user", thinkingLevel: "off", messages: [user()], ...overrides };
@@ -341,6 +349,82 @@ test("each new user prompt reclassifies; continuations and restored state do not
   assert.deepEqual(restored, continued);
 });
 
+test("child routers start in auto despite inherited modes and routing state", async () => {
+  const parent = harness();
+  setRoutingMode(parent.pi, parent.ctx, "auto", "complex");
+  const parentRoute = await parent.route(request(), parent.ctx);
+  const parentState = parentRoute.state;
+  for (const inherited of [undefined, parentState, { ...parentState, sessionId: "parent-session" }]) {
+    const branch = structuredClone(parent.branch);
+    const h = harness(config(), response("simple"), "auto", branch);
+    enableChildRouter(h.pi);
+    const route = createRouter(config(), h.pi);
+    const result = await route(request({ state: inherited,
+      previous: { model: parentRoute.model, thinkingLevel: parentRoute.thinkingLevel },
+      messages: [user(":complex parent task"), response(), user("Find a definition")] }), h.ctx);
+    assert.equal(result.model.provider, "simple");
+    assert.equal(result.state.sessionId, "test-session");
+    assert.equal(h.calls.length, 1);
+    assert.equal(JSON.parse(h.calls[0].context.messages[0].content).currentPrompt, "Find a definition");
+    assert.deepEqual(branch, parent.branch);
+    assert.match(h.statuses.at(-1)[1], /^auto -> simple ->/);
+  }
+  assert.equal(getRoutingMode(parent.ctx, "auto"), "complex");
+  assert.equal(parent.calls.length, 0);
+});
+
+test("child routers classify only the first task and retain the choice across follow-ups and reloads", async () => {
+  const settings = config();
+  const h = harness(settings, response("reasoning"));
+  enableChildRouter(h.pi);
+  const route = createRouter(settings, h.pi);
+  const first = await route(request(), h.ctx);
+  const state = JSON.parse(JSON.stringify(first.state));
+  settings.routes.reasoning.model = "edited-config";
+  for (const reason of ["user", "continuation", "retry", "direct"]) {
+    const next = await route(request({ reason, state, messages: [user(":simple Follow up")] }), h.ctx);
+    assert.equal(next.model, first.model);
+    assert.equal(next.thinkingLevel, first.thinkingLevel);
+    assert.equal(next.state, undefined);
+  }
+  const restored = await createRouter(config(), h.pi)(request({ state }), h.ctx);
+  assert.equal(restored.model, first.model);
+  assert.equal(h.calls.length, 1);
+  assert.deepEqual(h.branch, []);
+  const failed = { model: first.model, thinkingLevel: "minimal" };
+  assert.deepEqual(await route(request({ reason: "retry", state, failed }), h.ctx), failed);
+  assert.equal(h.calls.length, 1);
+});
+
+test("forking an already-routed child makes a new automatic choice without altering its parent", async () => {
+  let category = "simple";
+  const h = harness(config(), () => Promise.resolve(response(category)));
+  enableChildRouter(h.pi);
+  const route = createRouter(config(), h.pi);
+  const parent = await route(request(), h.ctx);
+  category = "complex";
+  h.ctx.sessionManager.getSessionId = () => "fork-session";
+  const fork = await route(request({ state: parent.state, previous: parent }), h.ctx);
+  assert.equal(fork.model.provider, "complex");
+  assert.equal(fork.state.sessionId, "fork-session");
+  h.ctx.sessionManager.getSessionId = () => "test-session";
+  assert.equal((await route(request({ state: parent.state }), h.ctx)).model.provider, "simple");
+  assert.equal(h.calls.length, 2);
+});
+
+test("child routers keep a fallback choice and fail explicitly if their pinned target disappears", async () => {
+  const h = harness(config(), () => Promise.reject(new Error("classifier unavailable")));
+  enableChildRouter(h.pi);
+  const route = createRouter(config(), h.pi);
+  const first = await route(request(), h.ctx);
+  assert.equal(first.model.provider, "medium");
+  assert.equal((await route(request({ state: first.state }), h.ctx)).model, first.model);
+  h.models.delete(`${first.model.provider}/${first.model.id}`);
+  await assert.rejects(route(request({ state: first.state }), h.ctx), /not in Pi's chat catalog/);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.warnings.length, 1);
+});
+
 test("retry uses failed physical pair; routing-error retries use persisted choice", async () => {
   const h = harness();
   const failed = { model: { provider: "failed-provider", id: "failed-model", api: "chat-api" }, thinkingLevel: "minimal" };
@@ -459,6 +543,103 @@ test("multiple-model config validates every router and supports old single-route
   assert.throws(() => validateModelsConfig({ models: { fast: {} } }), /models.fast/);
 });
 
+test("automatic child registration uses the loaded owner, follows lifecycle, and preserves other owners", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-auto-router-child-registration-"));
+  const originalEnv = process.env.PI_AUTO_ROUTER_CONFIG;
+  const originalArgv = process.argv;
+  t.after(() => {
+    process.argv = originalArgv;
+    if (originalEnv === undefined) delete process.env.PI_AUTO_ROUTER_CONFIG;
+    else process.env.PI_AUTO_ROUTER_CONFIG = originalEnv;
+    rmSync(dir, { recursive: true });
+  });
+  const configPath = join(dir, "config.json");
+  writeFileSync(configPath, JSON.stringify(config()));
+  process.env.PI_AUTO_ROUTER_CONFIG = configPath;
+  process.argv = ["node", "pi"];
+  const owner = join(dir, "local-package");
+  mkdirSync(owner);
+  writeFileSync(join(owner, "package.json"), JSON.stringify({ name: "pi-subagents", type: "module",
+    exports: { "./required-child-extensions": "./api.js" } }));
+  writeFileSync(join(owner, "index.js"), "");
+  writeFileSync(join(owner, "api.js"), `
+    export const registrations = [];
+    export function registerRequiredChildExtensions(input) {
+      if (registrations.some((entry) => !entry.disposed && entry.input.sessionId === input.sessionId))
+        throw new Error("duplicate registration");
+      const entry = { input, disposed: false, dispose() { this.disposed = true; } };
+      registrations.push(entry);
+      return entry;
+    }
+  `);
+  const api = await import(pathToFileURL(join(owner, "api.js")).href);
+  const h = harness();
+  const handlers = new Map();
+  const command = { name: "subagents", source: "extension", sourceInfo: { path: join(owner, "index.js") } };
+  let commands = [command];
+  let child = false;
+  Object.assign(h.pi, {
+    registerFlag() {}, registerVirtualModel() {},
+    getFlag: () => undefined,
+    events: { emit: (_channel, state) => { state.subagent = child; } },
+    getCommands: () => commands,
+    on: (event, handler) => handlers.set(event, handler),
+  });
+  extension(h.pi);
+  const emit = (type) => handlers.get(type)({ type }, h.ctx);
+  await emit("session_start");
+  assert.deepEqual(api.registrations[0].input, { sessionId: "test-session",
+    extensions: [
+      { id: "pi-auto-router", path: fileURLToPath(new URL("./index.js", import.meta.url)) },
+      { id: "pi-auto-router-child", path: fileURLToPath(new URL("./subagent.js", import.meta.url)) },
+    ] });
+  await emit("session_tree");
+  assert.equal(api.registrations.length, 1);
+  await emit("model_select");
+  assert.equal(api.registrations.length, 2);
+  assert.equal(api.registrations[0].disposed, true);
+  h.ctx.model = { provider: "physical", id: "model" };
+  await emit("model_select");
+  assert.ok(api.registrations.every((entry) => entry.disposed));
+  h.ctx.model = { provider: "autorouter", id: "auto" };
+  const pending = emit("model_select");
+  h.ctx.model = { provider: "physical", id: "model" };
+  await emit("model_select");
+  await pending;
+  assert.equal(api.registrations.length, 2);
+  h.ctx.model = { provider: "autorouter", id: "auto" };
+  await emit("session_start");
+  await emit("session_shutdown");
+  assert.ok(api.registrations.every((entry) => entry.disposed));
+  h.ctx.sessionManager.getSessionId = () => "new-session";
+  await emit("session_start");
+  assert.equal(api.registrations.at(-1).input.sessionId, "new-session");
+  child = true;
+  await emit("session_start");
+  assert.ok(api.registrations.every((entry) => entry.disposed));
+  child = false;
+  commands = [];
+  const count = api.registrations.length;
+  await emit("session_start");
+  assert.equal(api.registrations.length, count);
+  commands = [{ ...command, source: "prompt" }];
+  await emit("session_start");
+  assert.equal(api.registrations.length, count);
+  const oldOwner = join(dir, "old-package");
+  mkdirSync(oldOwner);
+  writeFileSync(join(oldOwner, "package.json"), JSON.stringify({ name: "pi-subagents", type: "module", exports: {} }));
+  writeFileSync(join(oldOwner, "index.js"), "");
+  commands = [{ name: "subagents", source: "extension", sourceInfo: { path: join(oldOwner, "index.js") } }];
+  await emit("session_start");
+  assert.match(h.warnings.at(-1)[0], /update pi-subagents.*required-child-extensions API missing/);
+  assert.equal(h.warnings.at(-1)[1], "warning");
+  commands = [command];
+  const external = api.registerRequiredChildExtensions({ sessionId: "new-session", extensions: [] });
+  await assert.rejects(emit("session_start"), /duplicate registration/);
+  assert.equal(external.disposed, false);
+  external.dispose();
+});
+
 test("input controls handle bare switches, defer queued prefixes, preserve images and restore lifecycle status", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "pi-auto-router-input-"));
   const originalEnv = process.env.PI_AUTO_ROUTER_CONFIG;
@@ -477,7 +658,7 @@ test("input controls handle bare switches, defer queued prefixes, preserve image
   const handlers = new Map();
   const definitions = new Map();
   Object.assign(h.pi, {
-    registerFlag() {}, getFlag() {},
+    registerFlag() {}, getFlag() {}, getCommands: () => [],
     on: (event, handler) => handlers.set(event, handler),
     registerVirtualModel: (definition) => definitions.set(definition.id, definition),
   });
@@ -623,6 +804,7 @@ test("extension registers independent routers at startup; CLI overrides env; inv
     on: () => {},
     registerFlag: (name, options) => { flag = { name, ...options }; },
     getFlag: () => undefined,
+    getCommands: () => [],
     registerVirtualModel: (value) => { definitions.set(value.id, value); },
   };
   extension(pi);
@@ -654,6 +836,18 @@ test("extension registers independent routers at startup; CLI overrides env; inv
     assert.equal(continued.model.id, state.target.model);
     assert.equal(h.calls.length, 1);
   }
+  enableChildRouter(pi);
+  for (const [id, settings] of [["auto", auto], ["fast", fast]]) {
+    const h = harness(settings);
+    const route = definitions.get(id).route;
+    const first = await route(request(), h.ctx);
+    const next = await route(request({ state: first.state }), h.ctx);
+    assert.equal(next.model, first.model);
+    assert.equal(next.thinkingLevel, settings.routes.simple.thinkingLevel);
+    assert.equal(first.state.sessionId, "test-session");
+    assert.equal(h.calls.length, 1);
+  }
+  delete pi.events;
   // No mid-session reconfiguration; a new factory reads the updated file.
   writeFileSync(path, JSON.stringify({ models: { fast } }));
   assert.equal((await definitions.get("auto").route(request(), a.ctx)).model.id, auto.routes.simple.model);

@@ -4,6 +4,8 @@ A Pi extension that registers multiple virtual models under **`autorouter`**.
 Each uses a normal chat LLM to classify new user prompts, then dispatches them
 to its own configured models and thinking levels. Use a short `:tier` prefix to
 select a sticky tier instead of automatic classification.
+Native Pi children can reuse the selected router profile, classify only their
+first task, and retain that physical model and thinking level for their lifetime.
 No Jev, Decisions API, extra service, build step, or runtime dependencies.
 Built against Pi 1.1.0's `registerVirtualModel` API.
 
@@ -191,7 +193,49 @@ it never silently falls back or re-enables auto. The selected mode remains saved
 so you can fix credentials or select `:auto`/another tier. This feature does not
 change `/plan` mode or tool permissions.
 
+## Native Pi subagents
+
+With `pi-subagents` loaded and an `autorouter/<id>` model selected in the parent,
+child integration is automatic—**no extra settings to edit**. The router uses
+`pi-subagents/required-child-extensions` to load the router and a small child-only
+marker in native children, including foreground children that do not inherit
+virtual models. The marker changes routing behavior, **not model selection**.
+
+Native children keep normal model inheritance and explicit per-agent/per-launch
+overrides. A child inheriting `autorouter/work` uses the `work` configuration;
+no particular profile is made the default. An explicitly selected physical
+model stays physical and bypasses routing.
+
+For children that select an `autorouter/<id>` model:
+
+- A new child always routes automatically, ignoring inherited manual tier modes.
+  Its first task prompt is classified once, with the usual bounded conversation
+  context when the child is a fork.
+- Tool continuations, retries, steering, and follow-ups keep that first physical
+  model and thinking level. Reloading or resuming the same child keeps its choice;
+  a new fork has a different session ID and makes a new automatic choice.
+- A classifier failure pins the fallback target instead. An unavailable pinned
+  target fails explicitly; it never silently substitutes another model.
+- Manual `:tier` controls apply only in normal parent sessions.
+  The parent session's mode and routing behavior are unchanged.
+
+The registration is session-scoped, cleared on shutdown or switching away from
+the router, and restored on reload. It does not rewrite settings or add a fixed
+`defaultModel`. Required files survive per-agent extension-list overrides and
+are deduplicated when the normal router also loads in background children.
+A capability ceiling that denies extensions rejects the native launch instead
+of being bypassed; required load failures are explicit too.
+
+Use a `pi-subagents` version exporting `required-child-extensions`; older versions
+produce an update warning. Without `pi-subagents`, normal parent routing works
+unchanged. Its API currently permits one host registration per parent session;
+a conflicting host registration reports an error rather than replacing it.
+Reload/restart Pi after updating the extension. External runners such as
+Claude Code and Codex CLI do not use these Pi routers and are unaffected.
+
 ## Routing contract
+
+For normal parent sessions (child sessions differ as described above):
 
 1. In auto mode, every new user message, including steering/follow-up messages,
    gets a new classification. Manual mode reuses the selected tier until changed.
@@ -239,7 +283,8 @@ Routing does **not** turn on `/plan` mode or change any tool permissions.
   or choose a trusted/local classifier if needed. Prompt instructions cannot
   make an LLM classifier immune to prompt injection.
 - In auto mode, classification adds a paid chat request and latency for each new
-  user prompt. Classifier output has a 2048-token cap; unusually heavy classifier thinking
+  user prompt, or only the first prompt per native child using `subagent.js`.
+  Classifier output has a 2048-token cap; unusually heavy classifier thinking
   can exhaust it and trigger fallback. A fast model with low thinking is best.
 - Classifier calls are out-of-band; do not assume Pi's session cost includes
   them. Provider billing does. Switching task models can lose prompt-cache reuse.
@@ -251,6 +296,7 @@ Routing does **not** turn on `/plan` mode or change any tool permissions.
 ```sh
 npm test
 node --check index.js
+node --check subagent.js
 node --check router.js
 bash test/pi-smoke.sh
 ```
@@ -260,9 +306,23 @@ credentials, or billed requests are required. They cover validation, parsing,
 context bounds, each route, failures, cancellation, timeout, sticky turns,
 retry/direct behavior, persisted state, independent routers, legacy config,
 startup config selection, sticky tier controls, standalone switches, queued
-prefixes, branch restoration, target failures, status styling, and activation hints.
+prefixes, branch restoration, target failures, status styling, activation hints,
+and automatic child registration, lifecycle cleanup, and optional API absence.
 The smoke script additionally starts real Pi CLI processes against a mock
 in-process chat provider, verifying both virtual models, all four routes,
 thinking levels, package loading, CLI config precedence, and sticky controls
 across saved-session resumes. It uses isolated temporary Pi settings
 and makes no network or paid model requests.
+
+With `pi-subagents` installed, also check its native child session factory:
+
+```sh
+node test/subagent-smoke.mjs /path/to/node_modules/pi-subagents \
+  /path/to/node_modules/@earendil-works/pi-coding-agent
+```
+
+This mock-provider test loads both real extensions with empty settings and checks
+automatic registration, model inheritance/overrides, capability ceilings, both
+extension load orders, fresh children, follow-ups, queued steering, forks from
+manual parents and routed children, and resume persistence. It uses isolated
+temporary settings and no network or paid model requests.

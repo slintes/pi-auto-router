@@ -1,7 +1,9 @@
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
-import { CATEGORIES, createRouter, getRoutingMode, loadConfig, parseTierPrefix, setRoutingMode, setRouterStatus } from "./router.js";
+import { CATEGORIES, createRouter, getRoutingMode, isSubagent, loadConfig, parseTierPrefix, setRoutingMode, setRouterStatus } from "./router.js";
 
 export default function autoRouter(pi) {
   pi.registerFlag("auto-router-config", {
@@ -29,6 +31,40 @@ export default function autoRouter(pi) {
       route: createRouter(settings, pi, id),
     });
   }
+  let childRegistration;
+  let registrationVersion = 0;
+  function disposeChildRegistration() {
+    registrationVersion++;
+    childRegistration?.dispose();
+    childRegistration = undefined;
+  }
+  async function registerChildExtension(ctx) {
+    disposeChildRegistration();
+    const version = registrationVersion;
+    if (isSubagent(pi) || ctx.model?.provider !== "autorouter" ||
+      !Object.hasOwn(config.models, ctx.model.id)) return;
+    const source = pi.getCommands().find((command) => command.source === "extension" && command.name === "subagents")?.sourceInfo?.path;
+    if (!source) return;
+    let apiPath;
+    try {
+      // Resolve from the loaded owner: separately installed Pi packages are not our Node dependencies.
+      apiPath = createRequire(source).resolve("pi-subagents/required-child-extensions");
+    } catch (error) {
+      if (error.code !== "MODULE_NOT_FOUND" && error.code !== "ERR_PACKAGE_PATH_NOT_EXPORTED") throw error;
+      ctx.ui.notify("Auto router: update pi-subagents to enable automatic child routing (required-child-extensions API missing).", "warning");
+      return;
+    }
+    const { registerRequiredChildExtensions } = await import(pathToFileURL(apiPath).href);
+    if (version !== registrationVersion) return;
+    childRegistration = registerRequiredChildExtensions({
+      sessionId: ctx.sessionManager.getSessionId(),
+      extensions: [
+        { id: "pi-auto-router", path: fileURLToPath(import.meta.url) },
+        { id: "pi-auto-router-child", path: fileURLToPath(new URL("./subagent.js", import.meta.url)) },
+      ],
+    });
+  }
+  pi.on("session_shutdown", disposeChildRegistration);
   function refreshStatus(event, ctx) {
     const id = ctx.model?.id;
     if (ctx.model?.provider !== "autorouter" || !Object.hasOwn(config.models, id)) {
@@ -36,9 +72,10 @@ export default function autoRouter(pi) {
       if (ctx.mode === "tui") ctx.ui.setWidget("pi-auto-router-hint", undefined);
       return;
     }
-    const mode = getRoutingMode(ctx, id);
+    const child = isSubagent(pi);
+    const mode = child ? "auto" : getRoutingMode(ctx, id);
     setRouterStatus(ctx, mode);
-    if (ctx.hasUI && (event.type === "session_start" ||
+    if (!child && ctx.hasUI && (event.type === "session_start" ||
       (event.type === "model_select" && event.source !== "restore" && event.previousModel?.provider !== "autorouter"))) {
       const hint = `Auto router: ${["auto", ...CATEGORIES].map((mode) => `:${mode}`).join(" ")} — prefix a prompt or send alone (sticky).`;
       // Pi's own model-switch status replaces info notifications before they render.
@@ -46,9 +83,13 @@ export default function autoRouter(pi) {
       else ctx.ui.notify(hint, "info");
     }
   }
-  for (const event of ["session_start", "session_tree", "model_select"]) pi.on(event, refreshStatus);
+  for (const type of ["session_start", "session_tree", "model_select"]) pi.on(type, async (event, ctx) => {
+    refreshStatus(event, ctx);
+    if (event.type !== "session_tree") await registerChildExtension(ctx);
+  });
   pi.on("input", (event, ctx) => {
     if (ctx.mode === "tui") ctx.ui.setWidget("pi-auto-router-hint", undefined);
+    if (isSubagent(pi)) return { action: "continue" };
     const id = ctx.model?.id;
     if (ctx.model?.provider !== "autorouter" || !Object.hasOwn(config.models, id)) return { action: "continue" };
     let prefix;

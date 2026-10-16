@@ -8,5 +8,5 @@
   "scripts": { "test": "node --test router.test.js" },
   "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
   "pi": { "extensions": ["./index.js"] },
-  "files": ["index.js", "router.js", "config.example.json", "README.md"]
+  "files": ["index.js", "subagent.js", "router.js", "config.example.json", "README.md"]
 }
