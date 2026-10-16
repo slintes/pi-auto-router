@@ -116,7 +116,7 @@ try {
     await check(both, "reasoning", "simple:low", ["simple"], `normal extension cannot re-enable per-turn classification (order ${i})`);
   }
 
-  await check(parent, ":complex Parent task", "complex:high", ["complex"], "ordinary parent still supports forced tiers");
+  await check(parent, ":complex! Parent task", "complex:high", ["complex"], "ordinary parent still supports sticky forced tiers");
   assert.deepEqual(resolveRequiredChildExtensions(parent.sessionId), requiredExtensions);
   const parentBefore = readFileSync(parent.sessionFile, "utf8");
   const forked = await factory.create(launch(fork(parent)));

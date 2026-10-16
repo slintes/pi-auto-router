@@ -163,24 +163,27 @@ for (const category of CATEGORIES) {
   });
 }
 
-test("tier prefixes are exact leading tokens, not prose headings or embedded directives", () => {
+test("tier prefixes distinguish one-turn and sticky choices and require exact leading tokens", () => {
   for (const mode of ["auto", ...CATEGORIES]) {
-    assert.deepEqual(parseTierPrefix(`  :${mode}\nDo the work`), { mode, text: "Do the work" });
-    assert.deepEqual(parseTierPrefix(`:${mode}   `), { mode, text: "" });
+    assert.deepEqual(parseTierPrefix(`  :${mode}\nDo the work`), { mode, sticky: false, text: "Do the work" });
+    assert.deepEqual(parseTierPrefix(`:${mode}   `), { mode, sticky: false, text: "" });
+  }
+  for (const mode of CATEGORIES) {
+    assert.deepEqual(parseTierPrefix(`:${mode}! Do the work`), { mode, sticky: true, text: "Do the work" });
   }
   for (const text of ["complex: heading", "Explain :complex", "```\n:complex\n```", ":", "hello"]) {
     assert.equal(parseTierPrefix(text), undefined);
   }
-  for (const text of [":reasoining task", ":Complex task", ":complex! task", ":autoSECRET task"]) {
-    assert.throws(() => parseTierPrefix(text), /Use :auto, :simple, :medium, :complex, :reasoning/);
+  for (const text of [":reasoining task", ":Complex task", ":auto! task", ":complex!! task", ":autoSECRET task"]) {
+    assert.throws(() => parseTierPrefix(text), /Use :auto, :simple, :simple!, :medium, :medium!, :complex, :complex!, :reasoning, :reasoning!/);
   }
 });
 
 for (const category of CATEGORIES) {
-  test(`:${category} sticks across new prompts, survives restoration, and bypasses even a broken classifier`, async () => {
+  test(`:${category}! sticks across new prompts, survives restoration, and bypasses even a broken classifier`, async () => {
     const h = harness(config(), () => { throw new Error("Classifier must not run"); });
     h.models.delete("classify/chat");
-    const first = await h.route(request({ messages: [user(`:${category} Do work`)] }), h.ctx);
+    const first = await h.route(request({ messages: [user(`:${category}! Do work`)] }), h.ctx);
     assert.equal(first.model.provider, category);
     assert.equal(getRoutingMode(h.ctx, "auto"), category);
     const next = await createRouter(config(), h.pi)(request({ state: first.state }), h.ctx);
@@ -193,9 +196,28 @@ for (const category of CATEGORIES) {
   });
 }
 
+test("one-turn tiers override the saved mode only for their prompt", async () => {
+  const h = harness(config(), response("simple"));
+  const first = await h.route(request({ messages: [user(":complex Do work")] }), h.ctx);
+  assert.equal(first.model.provider, "complex");
+  assert.equal(getRoutingMode(h.ctx, "auto"), "auto");
+  assert.deepEqual(h.branch, []);
+  const next = await h.route(request({ state: first.state, messages: [user("Also update tests")] }), h.ctx);
+  assert.equal(next.model.provider, "simple");
+  assert.equal(h.calls.length, 1);
+
+  setRoutingMode(h.pi, h.ctx, "auto", "reasoning");
+  const override = await h.route(request({ messages: [user(":simple Just this one")] }), h.ctx);
+  assert.equal(override.model.provider, "simple");
+  assert.equal(getRoutingMode(h.ctx, "auto"), "reasoning");
+  const resumed = await h.route(request({ state: override.state, messages: [user("Continue")] }), h.ctx);
+  assert.equal(resumed.model.provider, "reasoning");
+  assert.equal(h.calls.length, 1);
+});
+
 test(":auto clears a lock, strips only the classifier's current marker, and stays automatic", async () => {
   const h = harness(config(), response("simple"));
-  const locked = await h.route(request({ messages: [user(":complex Do work")] }), h.ctx);
+  const locked = await h.route(request({ messages: [user(":complex! Do work")] }), h.ctx);
   const resetMessages = [user(":auto Classify this")];
   const reset = await h.route(request({ state: locked.state, messages: resetMessages }), h.ctx);
   assert.equal(reset.model.provider, "simple");
@@ -208,11 +230,11 @@ test(":auto clears a lock, strips only the classifier's current marker, and stay
 
 test("only directives in the new user batch change mode; the last directive wins", async () => {
   const h = harness();
-  const messages = [user(":reasoning old"), response(), user(":complex next"), user("Also tests")];
+  const messages = [user(":reasoning! old"), response(), user(":complex! next"), user("Also tests")];
   const routed = await h.route(request({ messages }), h.ctx);
   assert.equal(routed.model.provider, "complex");
   const next = await h.route(request({ state: routed.state, messages: [
-    ...messages, response(), user(":simple smaller"), user(":reasoning analyze"), user("And compare"),
+    ...messages, response(), user(":simple! smaller"), user(":reasoning! analyze"), user("And compare"),
   ] }), h.ctx);
   assert.equal(next.model.provider, "reasoning");
   setRoutingMode(h.pi, h.ctx, "auto", "auto");
@@ -259,11 +281,25 @@ test("forced target failures keep the selected mode and never classify or substi
     if (failure === "missing") h.models.delete(key);
     if (failure === "auth") h.ctx.modelRegistry.hasConfiguredAuth = (model) => model.provider !== "complex";
     if (failure === "virtual") h.models.get(key).api = "pi-virtual";
-    await assert.rejects(h.route(request({ messages: [user(":complex work")] }), h.ctx), /pi-auto-router:/);
+    await assert.rejects(h.route(request({ messages: [user(":complex! work")] }), h.ctx), /pi-auto-router:/);
     assert.equal(getRoutingMode(h.ctx, "auto"), "complex");
     assert.equal(h.calls.length, 0);
     assert.equal(h.warnings.length, 0);
   }
+});
+
+test("retry after :auto reuses its classified target instead of reclassifying", async () => {
+  let category = "complex";
+  const h = harness(config(), () => Promise.resolve(response(category)));
+  setRoutingMode(h.pi, h.ctx, "auto", "reasoning");
+  const messages = [user(":auto Do work")];
+  const first = await h.route(request({ messages }), h.ctx);
+  assert.equal(first.model.provider, "complex");
+  category = "simple";
+  const retry = await h.route(request({ reason: "retry", state: first.state, messages }), h.ctx);
+  assert.equal(retry.model, first.model);
+  assert.equal(h.calls.length, 1);
+  assert.equal(getRoutingMode(h.ctx, "auto"), "auto");
 });
 
 test("routing-error retries cannot substitute the previous turn's target for a forced tier", async () => {
@@ -275,10 +311,12 @@ test("routing-error retries cannot substitute the previous turn's target for a f
   h.models.delete(key);
   const messages = [user(":complex work")];
   await assert.rejects(h.route(request({ messages, state: previous.state }), h.ctx), /not in Pi's chat catalog/);
+  assert.equal(getRoutingMode(h.ctx, "auto"), "auto");
   await assert.rejects(h.route(request({ reason: "retry", messages, state: previous.state }), h.ctx), /not in Pi's chat catalog/);
   h.models.set(key, model);
   const recovered = await h.route(request({ reason: "retry", messages, state: previous.state }), h.ctx);
   assert.equal(recovered.model.provider, "complex");
+  assert.equal(getRoutingMode(h.ctx, "auto"), "auto");
   assert.equal(h.calls.length, 1);
 });
 
@@ -665,7 +703,7 @@ test("input controls handle bare switches, defer queued prefixes, preserve image
   extension(h.pi);
   const input = (text, extra = {}) => handlers.get("input")({ text, ...extra }, h.ctx);
   const refresh = (event, extra = {}) => handlers.get(event)({ type: event, ...extra }, h.ctx);
-  const hint = ["Auto router: :auto :simple :medium :complex :reasoning — prefix a prompt or send alone (sticky).", "info"];
+  const hint = ["Auto router: :simple :medium :complex :reasoning once; add ! for sticky; :auto resets.", "info"];
   for (const reason of ["startup", "new", "resume", "fork", "reload"]) {
     h.warnings.length = 0;
     refresh("session_start", { reason });
@@ -724,11 +762,18 @@ test("input controls handle bare switches, defer queued prefixes, preserve image
   h.ctx.mode = "rpc";
   assert.deepEqual(h.branch, []);
   assert.equal(h.calls.length, 0);
+  refresh("session_start");
+  h.warnings.length = 0;
   assert.deepEqual(input(":complex"), { action: "handled" });
-  assert.deepEqual(h.warnings, [["Auto router: mode set to complex.", "info"]]);
+  assert.deepEqual(h.warnings, [["Auto router: prefix a prompt with :complex for one turn, or use :complex! for sticky mode.", "info"]]);
+  assert.equal(h.statuses.at(-1)[1], "auto");
+  assert.equal(getRoutingMode(h.ctx, "auto"), "auto");
+  assert.deepEqual(h.branch, []);
+  assert.equal(h.calls.length, 0);
+  assert.deepEqual(input(":complex!"), { action: "handled" });
+  assert.deepEqual(h.warnings.at(-1), ["Auto router: sticky mode set to complex.", "info"]);
   assert.equal(h.statuses.at(-1)[1], "COMPLEX");
   assert.equal(getRoutingMode(h.ctx, "auto"), "complex");
-  assert.equal(h.calls.length, 0);
   const snapshot = structuredClone(h.branch);
   assert.deepEqual(input(":simple queued task", { streamingBehavior: "followUp" }), { action: "continue" });
   assert.deepEqual(h.branch, snapshot);
@@ -738,13 +783,13 @@ test("input controls handle bare switches, defer queued prefixes, preserve image
   assert.deepEqual(h.branch, snapshot);
   const delivered = await definitions.get("auto").route(request({ messages: [user(":simple queued task")] }), h.ctx);
   assert.equal(delivered.model.provider, "simple");
-  assert.equal(getRoutingMode(h.ctx, "auto"), "simple");
+  assert.equal(getRoutingMode(h.ctx, "auto"), "complex");
   assert.deepEqual(input(":auto", { images: [{ type: "image", data: "img" }] }), { action: "continue" });
-  assert.equal(getRoutingMode(h.ctx, "auto"), "simple");
+  assert.equal(getRoutingMode(h.ctx, "auto"), "complex");
   assert.deepEqual(input(":SECRET task"), { action: "handled" });
   assert.equal(h.warnings.at(-1)[1], "error");
   assert.ok(!h.warnings.at(-1)[0].includes("SECRET"));
-  assert.equal(getRoutingMode(h.ctx, "auto"), "simple");
+  assert.equal(getRoutingMode(h.ctx, "auto"), "complex");
   h.ctx.hasUI = false;
   assert.deepEqual(input(":SECRET task"), { action: "continue" });
   await assert.rejects(definitions.get("auto").route(request({ messages: [user(":SECRET task")] }), h.ctx), /unknown tier/);
@@ -752,7 +797,7 @@ test("input controls handle bare switches, defer queued prefixes, preserve image
   h.ctx.model.id = "fast";
   refresh("model_select");
   assert.equal(h.statuses.at(-1)[1], "auto");
-  input(":reasoning");
+  input(":reasoning!");
   assert.equal(getRoutingMode(h.ctx, "fast"), "reasoning");
   h.ctx.model = { provider: "physical", id: "model" };
   assert.deepEqual(input(":SECRET"), { action: "continue" });

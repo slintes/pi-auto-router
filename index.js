@@ -77,7 +77,7 @@ export default function autoRouter(pi) {
     setRouterStatus(ctx, mode);
     if (!child && ctx.hasUI && (event.type === "session_start" ||
       (event.type === "model_select" && event.source !== "restore" && event.previousModel?.provider !== "autorouter"))) {
-      const hint = `Auto router: ${["auto", ...CATEGORIES].map((mode) => `:${mode}`).join(" ")} — prefix a prompt or send alone (sticky).`;
+      const hint = `Auto router: ${CATEGORIES.map((mode) => `:${mode}`).join(" ")} once; add ! for sticky; :auto resets.`;
       // Pi's own model-switch status replaces info notifications before they render.
       if (ctx.mode === "tui") ctx.ui.setWidget("pi-auto-router-hint", [ctx.ui.theme.italic(hint)]);
       else ctx.ui.notify(hint, "info");
@@ -103,9 +103,13 @@ export default function autoRouter(pi) {
     }
     // Prompt prefixes stay attached until delivery, so removed/aborted queued prompts cannot change mode.
     if (!prefix || prefix.text.trim() || event.images?.length) return { action: "continue" };
+    if (prefix.mode !== "auto" && !prefix.sticky) {
+      ctx.ui.notify(`Auto router: prefix a prompt with :${prefix.mode} for one turn, or use :${prefix.mode}! for sticky mode.`, "info");
+      return { action: "handled" };
+    }
     setRoutingMode(pi, ctx, id, prefix.mode);
     refreshStatus(event, ctx);
-    ctx.ui.notify(`Auto router: mode set to ${prefix.mode}.`, "info");
+    ctx.ui.notify(prefix.mode === "auto" ? "Auto router: mode set to auto." : `Auto router: sticky mode set to ${prefix.mode}.`, "info");
     return { action: "handled" };
   });
 }

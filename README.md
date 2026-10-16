@@ -2,8 +2,8 @@
 
 A Pi extension that registers multiple virtual models under **`autorouter`**.
 Each uses a normal chat LLM to classify new user prompts, then dispatches them
-to its own configured models and thinking levels. Use a short `:tier` prefix to
-select a sticky tier instead of automatic classification.
+to its own configured models and thinking levels. Use a `:tier` prefix to force
+one prompt, or `:tier!` to keep using that tier instead of automatic classification.
 Native Pi children can reuse the selected router profile, classify only their
 first task, and retain that physical model and thinking level for their lifetime.
 No Jev, Decisions API, extra service, build step, or runtime dependencies.
@@ -147,50 +147,59 @@ overwritten by Pi's model-switch status. RPC clients receive an info notificatio
 The hint is UI-only: it is not added to model context, and it does not repeat for
 ordinary prompts, tree navigation, or switches between routers within `autorouter`.
 
-Every fresh session starts in **auto** mode. Prefix a prompt with a tier to select
-it for that prompt and all subsequent user messages until you choose another mode:
+Every fresh session starts in **auto** mode. Prefix a prompt with a tier for a
+one-prompt override; add `!` to make that tier sticky for subsequent prompts:
 
 ```text
-:complex Refactor the authentication flow.
-Now update the tests.                      (still complex)
-:reasoning Compare these two approaches.   (switches to reasoning)
-:auto Fix this typo.                       (automatic routing resumes immediately)
+:complex Refactor the authentication flow.     (complex for this prompt only)
+:reasoning! Compare these approaches.          (reasoning, and keep using it)
+:complex Update the tests.                     (complex once, then reasoning resumes)
+:auto Fix this typo.                           (clear sticky mode; classify this prompt)
 ```
 
-Controls: `:simple`, `:medium`, `:complex`, `:reasoning`, and `:auto`.
-They are lowercase, exact tokens at the start of a prompt (leading whitespace is
-allowed), followed by whitespace or the end of the message. A bare control such
-as `:complex` or `:auto` changes mode without calling any model. Unknown leading
-`:name` controls report an error and leave the mode unchanged; occurrences inside
-a prompt, prose headings such as `complex:`, and fenced code are not controls.
-In print mode (`-p`), Pi may repeat the previous assistant answer after a bare
-control; this is a display behavior, not a new model call.
+Controls: `:simple`, `:medium`, `:complex`, and `:reasoning` each apply to one
+prompt. Add `!` (`:simple!`, `:medium!`, `:complex!`, `:reasoning!`) to keep using
+a tier. `:auto` clears any sticky tier and resumes automatic classification.
+Controls are lowercase, exact tokens at the start of a prompt (leading whitespace
+is allowed), followed by whitespace or the end of the message. A bare one-shot
+tier such as `:complex` does not change mode; it explains how to use `:complex!`.
+A bare sticky tier such as `:complex!` changes mode without calling a model, as
+does a bare `:auto`. Unknown leading `:name` controls report an error and leave
+the mode unchanged; occurrences inside a prompt, prose headings such as
+`complex:`, and fenced code are not controls. In print mode (`-p`), Pi may repeat
+the previous assistant answer after a bare control; this is a display behavior,
+not a new model call.
 
-- Manual mode bypasses the classifier entirely. It selects the configured tier
-  in the **currently selected router**, not a different virtual model. Each router
-  keeps its own mode on the active session branch.
-- A prefix attached to a prompt takes effect when Pi processes that prompt, not
-  when it is queued. Removing or cancelling an undelivered queued prompt does not
-  change mode. If Pi delivers multiple user messages together, the last control
-  in that batch wins.
-- Bare controls take effect immediately, including while Pi is working. They
+- A one-shot tier prefix bypasses classification for that prompt without changing
+  the saved mode. The next prompt resumes auto or the previous sticky tier.
+  A sticky `:tier!` bypasses classification and saves the tier on the active
+  session branch. Each router keeps its own mode; `:auto` clears that router's
+  saved tier and classifies the current prompt.
+- Prefixes take effect when Pi processes the prompt, not when it is queued.
+  Removing or cancelling an undelivered queued prompt does not change mode. If Pi
+  delivers multiple user messages together, the last control in that batch wins.
+  One-shot prefixes in a batch apply to that delivered request only.
+- Bare `:tier!` and `:auto` switches take effect immediately, including while Pi
+  is working. A bare `:tier` only explains one-shot versus sticky syntax. Controls
   affect subsequent user requests, not the physical model already handling the
   current turn's tool chain or retry. Queued prompts use the mode active when
   processed, unless they carry their own prefix.
 - `/new` starts in auto. Resume, reload, compaction, forks, and session-tree
-  navigation preserve the mode recorded on that branch. Older sessions without
-  a saved mode start in auto. Switching to a physical model hides the router
-  status and leaves that router's saved mode intact.
+  navigation preserve the sticky mode recorded on that branch. Older sessions
+  without a saved mode start in auto. Switching to a physical model hides the
+  router status and leaves that router's saved sticky mode intact.
 - The status shows forced tiers in **bold, uppercase orange**, without a
   "locked" label. Auto mode is muted and chosen categories stay lowercase.
   Only the mode name is emphasized. Non-TUI modes use plain text.
 - Prefixes remain in the task prompt and conversation history. The classifier's
-  current prompt omits `:auto`; recent conversation can still contain prefixes.
+  current prompt omits its leading tier control (including `!`); recent
+  conversation can still contain prefixes.
   Mode entries store plain data, never terminal styling.
 
 A forced tier with an unavailable model or missing credentials fails explicitly;
-it never silently falls back or re-enables auto. The selected mode remains saved,
-so you can fix credentials or select `:auto`/another tier. This feature does not
+it never silently falls back or re-enables auto. A `:tier!` choice remains saved,
+so you can fix credentials or select `:auto`/another sticky tier. A one-shot
+`:tier` does not change the saved mode. This feature does not
 change `/plan` mode or tool permissions.
 
 ## Native Pi subagents
@@ -238,8 +247,9 @@ Claude Code and Codex CLI do not use these Pi routers and are unaffected.
 For normal parent sessions (child sessions differ as described above):
 
 1. In auto mode, every new user message, including steering/follow-up messages,
-   gets a new classification. Manual mode reuses the selected tier until changed.
-   Automatically chosen categories never become sticky modes.
+   gets a new classification. A `:tier` prefix forces only that delivered request;
+   `:tier!` reuses the selected tier until changed. Automatically chosen categories
+   never become sticky modes.
 2. The classifier receives a system instruction and a JSON payload containing
    the bounded current prompt, bounded recent conversation text, and an image
    count. It has **no tools** and does not receive the main system prompt,

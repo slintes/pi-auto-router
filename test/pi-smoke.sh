@@ -70,12 +70,18 @@ check_sticky() {
   printf 'PASS: %s -> %s (saved session; calls: %s)\n' "$prompt" "${expected:-no model call}" "${calls:-none}"
 }
 check_sticky ':complex Do a task' 'router-smoke/complex:high' 'complex'
-check_sticky 'reasoning' 'router-smoke/complex:high' 'complex'
+check_sticky 'reasoning' 'router-smoke/reasoning:xhigh' 'classifier,reasoning'
 check_sticky ':simple' '' ''
+check_sticky ':simple!' '' ''
 check_sticky 'complex' 'router-smoke/simple:low' 'simple'
+check_sticky ':complex Do this once' 'router-smoke/complex:high' 'complex'
+check_sticky 'simple' 'router-smoke/simple:low' 'simple'
 check_sticky ':auto reasoning' 'router-smoke/reasoning:xhigh' 'classifier,reasoning'
 check_sticky 'simple' 'router-smoke/simple:low' 'classifier,simple'
 check_sticky ':complex' '' ''
+check_sticky 'reasoning' 'router-smoke/reasoning:xhigh' 'classifier,reasoning'
+check_sticky ':complex!' '' ''
+check_sticky 'reasoning' 'router-smoke/complex:high' 'complex'
 check_sticky ':auto' '' ''
 check_sticky 'reasoning' 'router-smoke/reasoning:xhigh' 'classifier,reasoning'
 : > "$tmp/calls.log"

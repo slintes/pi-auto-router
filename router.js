@@ -113,10 +113,13 @@ function textContent(message) {
 export function parseTierPrefix(text) {
   const match = /^\s*:([^\s]+)(?:\s+|$)/.exec(text);
   if (!match) return undefined;
-  if (!MODES.includes(match[1])) {
-    throw new Error(`Auto router: unknown tier. Use ${MODES.map((mode) => `:${mode}`).join(", ")}.`);
+  const sticky = match[1].endsWith("!");
+  const mode = sticky ? match[1].slice(0, -1) : match[1];
+  if (!MODES.includes(mode) || (sticky && mode === "auto")) {
+    const controls = MODES.flatMap((name) => name === "auto" ? [":auto"] : [`:${name}`, `:${name}!`]);
+    throw new Error(`Auto router: unknown tier. Use ${controls.join(", ")}.`);
   }
-  return { mode: match[1], text: text.slice(match[0].length) };
+  return { mode, sticky, text: text.slice(match[0].length) };
 }
 
 export function getRoutingMode(ctx, id) {
@@ -252,8 +255,12 @@ export function createRouter(config, pi, id = "auto") {
     }
     const lastAssistant = request.messages.findLastIndex((message) => message.role === "assistant");
     const pendingUsers = request.messages.slice(lastAssistant + 1).filter((message) => message.role === "user");
+    const prefixes = !child && (request.reason === "user" || (request.reason === "retry" && pendingUsers.length > 0))
+      ? pendingUsers.map((message) => parseTierPrefix(textContent(message))) : [];
+    const prefix = prefixes.findLast((value) => value !== undefined);
     // An unresolved forced user turn must not retry on the previous turn's saved target.
-    const retryingManualUser = !child && request.reason === "retry" && pendingUsers.length > 0 && getRoutingMode(ctx, id) !== "auto";
+    const retryingManualUser = !child && request.reason === "retry" && pendingUsers.length > 0 &&
+      (prefix?.mode !== undefined && prefix.mode !== "auto" || getRoutingMode(ctx, id) !== "auto");
     if (!child && request.reason !== "user" && !retryingManualUser) {
       if (request.state) {
         const target = validateTarget(request.state.target, "router state target");
@@ -263,11 +270,9 @@ export function createRouter(config, pi, id = "auto") {
       const target = config.routes[config.fallbackCategory];
       return { model: resolveTarget(target, ctx.modelRegistry), thinkingLevel: target.thinkingLevel };
     }
-    // A queued batch may contain several user messages; validate all before committing its last switch.
-    const prefixes = child ? [] : pendingUsers.map((message) => parseTierPrefix(textContent(message)));
-    const prefix = prefixes.findLast((value) => value !== undefined);
+    // A queued batch may contain several user messages; the last directive applies when delivered.
     const mode = child ? "auto" : prefix?.mode ?? getRoutingMode(ctx, id);
-    if (prefix) {
+    if (prefix && (mode === "auto" || prefix.sticky)) {
       setRoutingMode(pi, ctx, id, mode);
       setRouterStatus(ctx, mode);
     }
