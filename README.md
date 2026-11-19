@@ -55,7 +55,7 @@ settings or inheritance. See `config.example.json` for a two-router example.
       "classifier": {
         "provider": "openai-codex",
         "model": "gpt-5.6-luna",
-        "thinkingLevel": "low"
+        "thinkingLevel": "off"
       },
       "routes": {
         "simple": {

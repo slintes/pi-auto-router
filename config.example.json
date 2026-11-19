@@ -4,7 +4,7 @@
       "classifier": {
         "provider": "openai-codex",
         "model": "gpt-5.6-luna",
-        "thinkingLevel": "low"
+        "thinkingLevel": "off"
       },
       "routes": {
         "simple": {
@@ -37,7 +37,7 @@
       "classifier": {
         "provider": "openai-codex",
         "model": "gpt-5.6-luna",
-        "thinkingLevel": "low"
+        "thinkingLevel": "off"
       },
       "routes": {
         "simple": {
